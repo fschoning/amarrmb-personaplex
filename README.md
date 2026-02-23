@@ -32,6 +32,9 @@ FP8 weight quantization and inference optimizations for **Blackwell GPUs** (DGX 
 
 ### Setup
 
+> **Note:** If conda is active, deactivate it first (`conda deactivate`) so the venv
+> is created from the system Python.
+
 ```bash
 python3 -m venv ~/personaplex-venv
 source ~/personaplex-venv/bin/activate
@@ -66,14 +69,31 @@ Open `https://<DGX_IP>:8998` in your browser. Expected frame time: **~74ms**.
 
 ### Setup
 
+> **Important:** If conda or miniforge is active, deactivate it first (`conda deactivate`).
+> The venv must be created from the **system** Python, not conda's Python, or you'll get
+> `_ctypes` ABI errors at import time.
+
 ```bash
-python3 -m venv ~/personaplex-venv
+/usr/bin/python3.12 -m venv ~/personaplex-venv
 source ~/personaplex-venv/bin/activate
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
 git clone https://github.com/amarrmb/personaplex.git && cd personaplex
 pip install -e moshi/.
 export HF_TOKEN=<YOUR_TOKEN>
 ```
+
+#### Fix Triton ptxas for Jetson Thor
+
+The Triton package bundles a `ptxas-blackwell` binary that doesn't recognize Jetson Thor's
+`sm_110a` GPU architecture. Replace it with the system ptxas from JetPack:
+
+```bash
+TRITON_BIN=~/personaplex-venv/lib/python3.12/site-packages/triton/backends/nvidia/bin
+mv "$TRITON_BIN/ptxas-blackwell" "$TRITON_BIN/ptxas-blackwell.orig"
+ln -s /usr/local/cuda/bin/ptxas "$TRITON_BIN/ptxas-blackwell"
+```
+
+This is not needed on DGX Spark (`sm_121` is supported by the bundled binary).
 
 ### Run
 
