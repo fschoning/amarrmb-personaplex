@@ -1,0 +1,25 @@
+name: "lavasr_v2"
+backend: "python"
+max_batch_size: 0
+
+# Swap backend to "tensorrt" once export_lavasr.py has built model.plan
+# backend: "tensorrt"
+
+input [
+  { name: "PCM_24K"  data_type: TYPE_FP32  dims: [1, 1, 1920] }
+]
+
+output [
+  { name: "OUTPUT_PCM_48K"  data_type: TYPE_FP32  dims: [1, 1, 3840] }
+]
+
+# LavaSR is stateless; single instance easily serves all sessions (5000x RT).
+# max_batch_size: 0 means each inference has explicit batch dim in the tensor.
+
+instance_group [
+  {
+    count: 1
+    kind: KIND_GPU
+    gpus: [0]
+  }
+]

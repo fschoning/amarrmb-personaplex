@@ -183,3 +183,11 @@ mlx-trace.json
 # Include everything in assets
 !assets/
 !assets/**
+
+# PersonaPlex v2 additions
+bash.exe.stackdump
+*.stackdump
+gateway/build_dir/
+gateway/build/
+model_repository/lavasr_v2/1/model.plan
+model_repository/lavasr_v2/1/lavasr_v2.onnx

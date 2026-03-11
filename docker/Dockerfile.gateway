@@ -1,0 +1,38 @@
+# docker/Dockerfile.gateway
+# Builds the C++ PersonaPlex gateway using the Triton SDK image for libraries
+
+FROM nvcr.io/nvidia/tritonserver:25.02-py3-sdk AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake ninja-build build-essential git zlib1g-dev libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Copy gateway source
+COPY gateway/ /build/
+
+# Build
+RUN cmake -GNinja -B build_dir \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DTRITON_CLIENT_DIR=/workspace/install \
+    && cmake --build build_dir --target personaplex_gateway -j$(nproc)
+
+# ---
+FROM ubuntu:22.04 AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libssl3 zlib1g ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy binary and runtime libs from builder
+COPY --from=builder /build/build_dir/personaplex_gateway /usr/local/bin/
+COPY --from=builder /workspace/install/lib/libgrpcclient.so* /usr/local/lib/
+RUN ldconfig
+
+# TLS certs mount point
+RUN mkdir -p /ssl
+
+EXPOSE 8998
+
+ENTRYPOINT ["/usr/local/bin/personaplex_gateway"]

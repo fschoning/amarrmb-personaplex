@@ -1,0 +1,36 @@
+# docker/Dockerfile.triton
+# Triton server container with moshi + LavaSR dependencies installed
+
+FROM nvcr.io/nvidia/tritonserver:25.02-py3
+
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install moshi Python package (provides MimiModel, LMGen, loaders, fp8_quantize)
+COPY moshi/ /app/moshi/
+RUN pip install --no-cache-dir -e /app/moshi/
+
+# Install LavaSR v2
+RUN pip install --no-cache-dir \
+        git+https://github.com/declinator/lava-sr.git || \
+    echo "WARNING: lavasr package not available — Python fallback will use torch.hub"
+
+# Copy model repository and scripts into image
+COPY model_repository/ /models/
+COPY scripts/ /app/scripts/
+RUN chmod +x /app/scripts/*.sh
+
+# Pre-warm HuggingFace weights (downloads Mimi + Moshi checkpoint)
+ARG HF_TOKEN=""
+ENV HF_TOKEN=${HF_TOKEN}
+RUN if [ -n "${HF_TOKEN}" ]; then \
+        python -c "from moshi.models import loaders; loaders.get_mimi_weight_path(); loaders.get_moshi_weight_path()"; \
+    else \
+        echo "HF_TOKEN not set — weights will download on first run"; \
+    fi
+
+ENTRYPOINT ["/app/scripts/start_triton.sh"]

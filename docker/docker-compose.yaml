@@ -1,0 +1,70 @@
+# docker/docker-compose.yaml — PersonaPlex v2 full stack
+
+name: personaplex-v2
+
+services:
+
+  # -------------------------------------------------------------------------
+  # Triton Inference Server
+  # -------------------------------------------------------------------------
+  triton:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.triton
+      args:
+        HF_TOKEN: "${HF_TOKEN:-}"
+    image: personaplex-triton:latest
+    restart: unless-stopped
+    ports:
+      - "8001:8001"   # gRPC
+      - "8000:8000"   # HTTP (diagnostics only)
+      - "8002:8002"   # Prometheus metrics
+    environment:
+      HF_REPO:           "${HF_REPO:-}"
+      HF_TOKEN:          "${HF_TOKEN:-}"
+      LAVASR_HF_REPO:    "${LAVASR_HF_REPO:-declinator/lava-sr-v2}"
+      PERSONAPLEX_FP8:   "${PERSONAPLEX_FP8:-1}"
+      LM_TEMPERATURE:    "${LM_TEMPERATURE:-0.8}"
+      LM_TOP_K:          "${LM_TOP_K:-250}"
+    volumes:
+      - hf_cache:/root/.cache/huggingface   # persists weight downloads
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/v2/health/ready"]
+      interval: 15s
+      timeout: 10s
+      retries: 12
+      start_period: 120s   # weight load can take a few minutes
+
+  # -------------------------------------------------------------------------
+  # C++ Gateway (WebSocket → Triton gRPC)
+  # -------------------------------------------------------------------------
+  gateway:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.gateway
+    image: personaplex-gateway:latest
+    restart: unless-stopped
+    depends_on:
+      triton:
+        condition: service_healthy
+    ports:
+      - "${WS_PORT:-8998}:8998"
+    environment:
+      TRITON_GRPC_URL:    "triton:8001"
+      MAX_SESSIONS:       "${MAX_SESSIONS:-6}"
+      SESSION_TIMEOUT_S:  "${SESSION_TIMEOUT_S:-300}"
+      WS_PORT:            "8998"
+      SSL_CERT:           "${SSL_CERT:-}"
+      SSL_KEY:            "${SSL_KEY:-}"
+    volumes:
+      - "${SSL_DIR:-./ssl}:/ssl:ro"
+
+volumes:
+  hf_cache:
