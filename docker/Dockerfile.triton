@@ -5,7 +5,7 @@ FROM nvcr.io/nvidia/tritonserver:25.02-py3
 
 # System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libsndfile1 \
+        libsndfile1 libopus-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
