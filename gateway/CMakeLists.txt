@@ -50,9 +50,12 @@ set(TRITON_CLIENT_DIR "/workspace/install" CACHE PATH
 find_library(GRPCCLIENT_LIB grpcclient
     HINTS ${TRITON_CLIENT_DIR}/lib
     REQUIRED)
-find_library(GRPC_LIB         grpc      REQUIRED)
-find_library(GPR_LIB          gpr       REQUIRED)
-find_library(PROTOBUF_LIB     protobuf  REQUIRED)
+
+# gRPC/protobuf libs — bundled alongside grpcclient in the SDK image
+find_library(GRPC_LIB     grpc      HINTS ${TRITON_CLIENT_DIR}/lib /usr/local/lib)
+find_library(GRPCPP_LIB   grpc++    HINTS ${TRITON_CLIENT_DIR}/lib /usr/local/lib)
+find_library(GPR_LIB      gpr       HINTS ${TRITON_CLIENT_DIR}/lib /usr/local/lib)
+find_library(PROTOBUF_LIB protobuf  HINTS ${TRITON_CLIENT_DIR}/lib /usr/local/lib)
 
 # ---------------------------------------------------------------------------
 # Gateway executable
@@ -73,16 +76,21 @@ target_include_directories(personaplex_gateway PRIVATE
     ${simdjson_SOURCE_DIR}/include
 )
 
-target_link_libraries(personaplex_gateway PRIVATE
+# Build the link list — only include libs that were found
+set(_LINK_LIBS
     uSockets
     ${GRPCCLIENT_LIB}
-    ${GRPC_LIB}
-    ${GPR_LIB}
-    ${PROTOBUF_LIB}
     simdjson
     pthread
     z
 )
+foreach(_lib GRPCPP_LIB GRPC_LIB GPR_LIB PROTOBUF_LIB)
+    if(${_lib})
+        list(APPEND _LINK_LIBS ${${_lib}})
+    endif()
+endforeach()
+
+target_link_libraries(personaplex_gateway PRIVATE ${_LINK_LIBS})
 
 # DGX Spark: enable AVX2 for base64 and SIMD optimisations
 target_compile_options(personaplex_gateway PRIVATE
