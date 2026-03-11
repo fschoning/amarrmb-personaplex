@@ -93,7 +93,7 @@ std::string make_speech_stopped(int64_t ms) {
 
 std::string make_error(const std::string& type,
                        const std::string& msg,
-                       const std::string& eid) {
+                       const std::string& /*eid*/) {
     std::ostringstream o;
     o << "{\"type\":\"error\",\"error\":{\"type\":\""
       << escape_json(type) << "\",\"message\":\""

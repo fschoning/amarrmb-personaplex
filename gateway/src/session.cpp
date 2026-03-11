@@ -4,6 +4,7 @@
 // gateway/src/session.cpp
 
 #include "session.h"
+#include "audio_utils.h"
 
 #include <cassert>
 #include <chrono>

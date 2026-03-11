@@ -174,7 +174,7 @@ int main(int argc, char** argv) {
             // --- Settings ---
             .compression      = uWS::DISABLED,       // raw PCM is incompressible
             .maxPayloadLength = 16 * 1024 * 1024,    // 16MB max message
-            .idleTimeout      = cfg.session_timeout_s,
+            .idleTimeout      = static_cast<unsigned short>(cfg.session_timeout_s),
 
             // --- onOpen ---
             .open = [&](uWS::WebSocket<false, true, WsData>* ws) {
@@ -212,7 +212,7 @@ int main(int argc, char** argv) {
             // --- onMessage ---
             .message = [&](uWS::WebSocket<false, true, WsData>* ws,
                            std::string_view msg,
-                           uWS::OpCode opcode)
+                           uWS::OpCode /*opcode*/)
             {
                 void* key = ws->getUserData()->key;
                 auto sess = sm.get(key);
@@ -256,7 +256,7 @@ int main(int argc, char** argv) {
             },
 
             // --- onClose ---
-            .close = [&](uWS::WebSocket<false, true, WsData>* ws, int code, std::string_view) {
+            .close = [&](uWS::WebSocket<false, true, WsData>* ws, int /*code*/, std::string_view) {
                 sm.remove(ws->getUserData()->key);
             }
         })
