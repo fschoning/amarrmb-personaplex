@@ -23,6 +23,7 @@ import argparse
 import asyncio
 import base64
 import json
+import os
 import queue
 import struct
 import sys
@@ -94,41 +95,39 @@ class PersonaPlexClient:
         self.frames_sent = 0
         self.output_buffer = bytearray()
 
-        # Streaming speaker output with pre-buffering to avoid clicks
+        # Speaker output via dedicated writer thread (no callbacks)
+        # write() blocks until the audio device is ready, naturally
+        # handling jitter without underruns or timing mismatches.
         self._speaker_queue = queue.Queue()
         self._speaker_stream = None
-        self._speaker_started = False
-        self._prebuffer_count = 3  # wait for N chunks before starting playback
-        self._prebuffer = []
+        self._speaker_thread = None
         if sd and np:
             try:
                 self._speaker_stream = sd.OutputStream(
                     samplerate=OUTPUT_RATE,
                     channels=1,
                     dtype='float32',
-                    blocksize=2048,   # larger blocks = fewer callbacks = fewer underruns
-                    callback=self._speaker_callback,
                 )
                 self._speaker_stream.start()
+                self._speaker_thread = threading.Thread(
+                    target=self._speaker_writer, daemon=True
+                )
+                self._speaker_thread.start()
             except Exception as e:
                 print(f"  [speaker] Could not open output stream: {e}")
                 self._speaker_stream = None
 
-    def _speaker_callback(self, outdata, frames, time_info, status):
-        """Sounddevice output callback — pulls audio from the queue."""
-        filled = 0
-        while filled < frames:
+    def _speaker_writer(self):
+        """Background thread: reads chunks from queue, writes to speaker."""
+        while self.running or not self._speaker_queue.empty():
             try:
-                chunk = self._speaker_queue.get_nowait()
-                n = min(len(chunk), frames - filled)
-                outdata[filled:filled + n, 0] = chunk[:n]
-                filled += n
-                if n < len(chunk):
-                    # Put remainder back (front of queue)
-                    self._speaker_queue.put(chunk[n:])
+                chunk = self._speaker_queue.get(timeout=0.1)
+                if self._speaker_stream:
+                    # write() blocks until audio device accepts data
+                    self._speaker_stream.write(chunk.reshape(-1, 1))
             except queue.Empty:
-                # No more audio — fill rest with silence
-                outdata[filled:, 0] = 0
+                continue
+            except Exception:
                 break
 
     async def connect(self):
@@ -189,19 +188,10 @@ class PersonaPlexClient:
                     self.audio_received += len(pcm_bytes)
                     self.output_buffer.extend(pcm_bytes)
 
-                    # Stream to speaker via queue (continuous, no restarts)
+                    # Stream to speaker via writer thread
                     if self._speaker_stream and np:
                         samples = pcm16_bytes_to_float32(pcm_bytes)
-                        if not self._speaker_started:
-                            # Pre-buffer to avoid initial underrun clicks
-                            self._prebuffer.append(samples)
-                            if len(self._prebuffer) >= self._prebuffer_count:
-                                for buf in self._prebuffer:
-                                    self._speaker_queue.put(buf)
-                                self._prebuffer.clear()
-                                self._speaker_started = True
-                        else:
-                            self._speaker_queue.put(samples)
+                        self._speaker_queue.put(samples)
 
                     # Progress indicator
                     ms = (self.audio_received // 2) * 1000 // OUTPUT_RATE
@@ -364,9 +354,10 @@ class PersonaPlexClient:
         print(f"Saved {ms}ms of output audio to {path}")
 
     async def close(self):
+        self.running = False
+        if self._speaker_thread:
+            self._speaker_thread.join(timeout=2.0)
         if self._speaker_stream:
-            # Drain remaining audio before closing
-            await asyncio.sleep(0.5)
             self._speaker_stream.stop()
             self._speaker_stream.close()
             self._speaker_stream = None
