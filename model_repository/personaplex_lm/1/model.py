@@ -199,10 +199,11 @@ class TritonPythonModel:
             for c in range(codes.shape[-1]):
                 result = self.lm_gen.step(codes[:, :, c:c+1])
                 if result is not None:
-                    # result: [1, dep_q+1, 1]  — row 0 = text token, rows 1–8 = audio
+                    # result: [1, dep_q+1, 1] — full output (17 rows for personaplex)
+                    # Decoder only needs first 9: row 0 = text, rows 1-8 = inner audio
                     text_tok = int(result[0, 0, 0].item())
                     last_text_token = text_tok
-                    all_tokens.append(result)
+                    all_tokens.append(result[:, :9, :])
 
             if all_tokens:
                 tokens_out = torch.cat(all_tokens, dim=-1).cpu().numpy().astype(np.int32)
