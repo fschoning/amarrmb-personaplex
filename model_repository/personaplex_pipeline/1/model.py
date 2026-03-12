@@ -131,6 +131,29 @@ class TritonPythonModel:
 
         self.lm_gen.step_system_prompts(self.mimi)
 
+        # CRITICAL: reset mimi streaming AFTER system prompts (matches server.py line 346)
+        # System prompts leave residual state in mimi's streaming buffers
+        self.mimi.reset_streaming()
+
+        # Post-system-prompt warmup: eat torch.compile re-trace cost HERE
+        # instead of during real-time frames. reset_streaming() invalidates
+        # torch.compile guards, so the first encode/decode after reset triggers
+        # a re-trace (~2-4s). Run it now during session setup.
+        frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
+        for _ in range(4):
+            chunk = torch.zeros(1, 1, frame_size, dtype=self._input_dtype, device=_DEVICE)
+            codes = self.mimi.encode(chunk)
+            for c in range(codes.shape[-1]):
+                tokens = self.lm_gen.step(codes[:, :, c:c + 1])
+                if tokens is not None:
+                    _ = self.mimi.decode(tokens[:, 1:9])
+        if _DEVICE.type == "cuda":
+            torch.cuda.synchronize()
+
+        # Reset again to clear warmup residue before real conversation
+        self.mimi.reset_streaming()
+        self.lm_gen.reset_streaming()
+
     # ------------------------------------------------------------------
     # Main execute — ALL processing in one function call, zero IPC
     # ------------------------------------------------------------------
