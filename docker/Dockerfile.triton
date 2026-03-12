@@ -26,9 +26,8 @@ WORKDIR /app
 COPY moshi/ /app/moshi/
 RUN pip install --no-cache-dir -e /app/moshi/
 
-# Install LavaSR v2 (audio super-resolution 24kHz→48kHz)
-# Real repo: https://github.com/ysharma3501/LavaSR
-RUN pip install --no-cache-dir git+https://github.com/ysharma3501/LavaSR.git
+# CPU DSP resampler (polyphase filtering for 24→48kHz frame smoothing)
+RUN pip install --no-cache-dir soxr
 
 # Copy model repository and scripts into image
 COPY model_repository/ /models/

@@ -23,6 +23,20 @@ import numpy as np
 import sentencepiece
 import torch
 
+# CPU DSP resampling — polyphase filtering to smooth Mimi frame transitions
+# soxr is preferred (libsoxr, ARM NEON-optimized), scipy as fallback
+try:
+    import soxr
+    _RESAMPLE = "soxr"
+except ImportError:
+    soxr = None
+    try:
+        from scipy.signal import resample_poly
+        _RESAMPLE = "scipy"
+    except ImportError:
+        resample_poly = None
+        _RESAMPLE = "linear"
+
 import triton_python_backend_utils as pb_utils
 
 from huggingface_hub import hf_hub_download
@@ -253,17 +267,34 @@ class TritonPythonModel:
         else:
             out_pcm = np.zeros((1, 1, 1920), dtype=np.float32)
 
+        # CPU DSP resample 24kHz → 48kHz (polyphase filtering)
+        # Smooths frame boundary transitions without hallucinating frequencies
+        pcm_1d = out_pcm.reshape(-1).astype(np.float32)
+        if _RESAMPLE == "soxr":
+            pcm_48k = soxr.resample(pcm_1d, 24000, 48000, quality='VHQ')
+        elif _RESAMPLE == "scipy":
+            pcm_48k = resample_poly(pcm_1d, up=2, down=1).astype(np.float32)
+        else:
+            # Linear interpolation fallback
+            n_out = len(pcm_1d) * 2
+            pcm_48k = np.interp(
+                np.linspace(0, len(pcm_1d) - 1, n_out),
+                np.arange(len(pcm_1d)), pcm_1d
+            ).astype(np.float32)
+        out_48k = pcm_48k.reshape(1, 1, -1)
+        t3 = time.monotonic()
+
         # Logging
         self._frame_count += 1
         if self._frame_count <= 5 or self._frame_count % 25 == 0:
             self.logger.log_info(
                 f"frame {self._frame_count}: "
-                f"enc={t1-t0:.3f}s lm+dec={t2-t1:.3f}s "
-                f"total={t2-t0:.3f}s"
+                f"enc={t1-t0:.3f}s lm+dec={t2-t1:.3f}s resample={t3-t2:.3f}s "
+                f"total={t3-t0:.3f}s ({_RESAMPLE})"
             )
 
         return self._make_response(
-            pcm=out_pcm,
+            pcm=out_48k,
             text_token=np.array([last_text_token], dtype=np.int32),
             ready=np.array([False]),
         )

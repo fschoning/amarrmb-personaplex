@@ -54,7 +54,7 @@ except ImportError:
 # Audio helpers
 # ---------------------------------------------------------------------------
 INPUT_RATE = 24000   # What the server expects
-OUTPUT_RATE = 24000  # What the server sends back (direct from Mimi decoder)
+OUTPUT_RATE = 48000  # Server resamples 24→48kHz via CPU DSP
 FRAME_MS = 80        # Send audio every 80ms
 FRAME_SAMPLES = INPUT_RATE * FRAME_MS // 1000  # 1920
 
@@ -377,42 +377,78 @@ class PersonaPlexClient:
 # ---------------------------------------------------------------------------
 # Voice selection helpers
 # ---------------------------------------------------------------------------
-def find_voice_prompts(voices_dir: str) -> list[Path]:
-    """Find all .pt voice prompt files in a directory."""
-    vdir = Path(voices_dir)
-    if not vdir.exists():
-        return []
-    return sorted(vdir.glob("*.pt"))
+
+# Static list of PersonaPlex voice prompts
+# NAT = Natural voice, VAR = Varied voice, F = Female, M = Male
+VOICE_NAMES = [
+    "NATF0", "NATF1", "NATF2", "NATF3",   # Natural Female
+    "NATM0", "NATM1", "NATM2", "NATM3",   # Natural Male
+    "VARF0", "VARF1", "VARF2", "VARF3", "VARF4",  # Varied Female
+    "VARM0", "VARM1", "VARM2", "VARM3", "VARM4",  # Varied Male
+]
+
+HF_VOICES_SUBPATH = (
+    "hub/models--nvidia--personaplex-7b-v1/snapshots/"
+    "fdaf4090a61cb315c138a1faee287ffd6c716309/voices"
+)
 
 
-def interactive_voice_select(voices_dir: str) -> str | None:
+def get_voices_dir() -> str | None:
+    """Find the HF-cached voices directory."""
+    hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+    voices_dir = os.path.join(hf_home, HF_VOICES_SUBPATH)
+    if os.path.isdir(voices_dir):
+        return voices_dir
+    return None
+
+
+def interactive_voice_select(voices_dir: str | None = None) -> str | None:
     """Show a numbered list of voices and let the user pick one."""
-    voices = find_voice_prompts(voices_dir)
-    if not voices:
-        print(f"  No .pt voice files found in {voices_dir}")
+    if voices_dir is None:
+        voices_dir = get_voices_dir()
+    if voices_dir is None:
+        print("  Voice prompts not found in HF cache.")
+        print("  Use --voice-prompt <path> to specify directly.")
         return None
 
-    print(f"\n  Available voices ({len(voices)}):")
-    for i, v in enumerate(voices, 1):
-        print(f"    {i:2d}. {v.stem}")
-    print(f"    {0:2d}. (no voice prompt — use default)")
+    # Group by category
+    categories = [
+        ("Natural Female",  [v for v in VOICE_NAMES if v.startswith("NATF")]),
+        ("Natural Male",    [v for v in VOICE_NAMES if v.startswith("NATM")]),
+        ("Varied Female",   [v for v in VOICE_NAMES if v.startswith("VARF")]),
+        ("Varied Male",     [v for v in VOICE_NAMES if v.startswith("VARM")]),
+    ]
+
+    print("\n  Available voices:")
+    idx = 1
+    voice_map = {}
+    for cat_name, names in categories:
+        print(f"    ── {cat_name} ──")
+        for name in names:
+            pt_path = os.path.join(voices_dir, f"{name}.pt")
+            exists = os.path.exists(pt_path)
+            marker = "" if exists else " (missing)"
+            print(f"    {idx:2d}. {name}{marker}")
+            voice_map[idx] = pt_path
+            idx += 1
+    print(f"     0. (no voice prompt — use default)")
 
     while True:
         try:
-            choice = input(f"\n  Select voice [1-{len(voices)}, 0=default]: ").strip()
+            choice = input(f"\n  Select voice [1-{idx-1}, 0=default]: ").strip()
             if not choice:
-                idx = 1  # default to first voice
+                n = 1
             else:
-                idx = int(choice)
-            if idx == 0:
+                n = int(choice)
+            if n == 0:
                 return None
-            if 1 <= idx <= len(voices):
-                selected = voices[idx - 1]
-                print(f"  Selected: {selected.stem}")
-                return str(selected)
-            print(f"  Please enter 0-{len(voices)}")
+            if n in voice_map:
+                selected = voice_map[n]
+                print(f"  Selected: {Path(selected).stem}")
+                return selected
+            print(f"  Please enter 0-{idx-1}")
         except (ValueError, EOFError):
-            return str(voices[0]) if voices else None
+            return list(voice_map.values())[0] if voice_map else None
 
 
 # ---------------------------------------------------------------------------
@@ -424,8 +460,10 @@ async def main():
     parser.add_argument("--port", type=int, default=8998, help="Gateway port")
     parser.add_argument("--prompt", default="", help="System prompt / instructions")
     parser.add_argument("--voice-prompt", default=None, help="Path to .pt voice prompt file")
+    parser.add_argument("--voice", action="store_true",
+                        help="Interactive voice picker (auto-finds HF cache)")
     parser.add_argument("--voices-dir", default=None,
-                        help="Directory containing .pt voice files (enables interactive picker)")
+                        help="Directory containing .pt voice files (overrides auto-detect)")
     parser.add_argument("--wav", default=None, help="Path to .wav file to send (mono)")
     parser.add_argument("--loopback", action="store_true", help="Send silence (protocol test)")
     parser.add_argument("--duration", type=float, default=10.0, help="Loopback/mic duration (s)")
@@ -434,7 +472,7 @@ async def main():
     args = parser.parse_args()
 
     # Interactive voice selection
-    if args.voices_dir and not args.voice_prompt:
+    if (args.voice or args.voices_dir) and not args.voice_prompt:
         args.voice_prompt = interactive_voice_select(args.voices_dir)
 
     scheme = "wss" if args.tls else "ws"
