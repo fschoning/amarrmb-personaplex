@@ -91,16 +91,17 @@ bool TritonSession::infer_one(
     tc::InferInput* vp_t  = nullptr;
     tc::InferInput* tp_t  = nullptr;
     {
-        // Voice prompt bytes
+        // Voice prompt bytes (TYPE_STRING, dims=[1] → exactly 1 string element)
+        // Triton BYTES/STRING encoding: 4-byte little-endian length prefix + data
         check(tc::InferInput::Create(&vp_t, "VOICE_PROMPT_BYTES", {1}, "BYTES"), "VP");
         if (is_start && voice_bytes && !voice_bytes->empty()) {
-            // SIZE prefix + data (Triton BYTES encoding)
             uint32_t sz = static_cast<uint32_t>(voice_bytes->size());
             vp_t->AppendRaw(reinterpret_cast<uint8_t*>(&sz), 4);
             vp_t->AppendRaw(voice_bytes->data(), voice_bytes->size());
         } else {
-            uint32_t sz = 0;
-            vp_t->AppendRaw(reinterpret_cast<uint8_t*>(&sz), 4);
+            // Empty string: length=0, no data bytes
+            // Must use AppendFromString to get proper BYTES framing
+            vp_t->AppendFromString({""});
         }
         inputs.push_back(vp_t);
 
