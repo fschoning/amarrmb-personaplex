@@ -1,46 +1,32 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: MIT
 #
-# Triton Python Backend — LavaSR v2
-# Upsamples 24kHz PCM [1, 1, 1920] → 48kHz PCM [1, 1, 3840].
+# Triton Python Backend — Audio Upsampler
+# Resamples 24kHz PCM [1, 1, 1920] → 48kHz PCM [1, 1, 3840].
+# Uses high-quality polyphase filtering on CPU (no GPU needed).
 # Stateless — one instance handles all sessions via dynamic batching.
-#
-# Uses ysharma3501/LavaSR from https://github.com/ysharma3501/LavaSR
-# HuggingFace model: YatharthS/LavaSR
-
-import json
-import os
 
 import numpy as np
-import torch
-import torchaudio
-
 import triton_python_backend_utils as pb_utils
 
-_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-_HF_REPO = os.environ.get("LAVASR_HF_REPO", "YatharthS/LavaSR")
+# Use scipy for high-quality polyphase resampling on CPU
+try:
+    from scipy.signal import resample_poly
+    _HAS_SCIPY = True
+except ImportError:
+    _HAS_SCIPY = False
 
 
 class TritonPythonModel:
 
     def initialize(self, args: dict):
         self.logger = pb_utils.Logger
-        self.logger.log_info("lavasr_v2: loading model...")
+        if _HAS_SCIPY:
+            self.logger.log_info("lavasr_v2: using scipy polyphase resampler (CPU)")
+        else:
+            self.logger.log_info("lavasr_v2: using numpy linear resampler (CPU)")
+        self.logger.log_info("lavasr_v2: ready (CPU-only, no GPU needed).")
 
-        try:
-            from LavaSR.model import LavaEnhance2
-            self.model = LavaEnhance2(_HF_REPO, _DEVICE.type)
-            self._mode = "lavasr"
-            self.logger.log_info(f"lavasr_v2: loaded from {_HF_REPO} (mode=lavasr)")
-        except Exception as e:
-            raise RuntimeError(
-                f"Cannot load LavaSR: {e}\n"
-                "Install with: pip install git+https://github.com/ysharma3501/LavaSR.git"
-            ) from e
-
-        self.logger.log_info("lavasr_v2: ready.")
-
-    @torch.no_grad()
     def execute(self, requests):
         responses = []
 
@@ -49,16 +35,19 @@ class TritonPythonModel:
                 request, "PCM_24K"
             ).as_numpy()   # [1, 1, 1920] float32, 24kHz
 
-            pcm = torch.from_numpy(pcm_np).to(_DEVICE)  # [1, 1, 1920]
+            # Squeeze to 1D for resampling
+            pcm_1d = pcm_np.reshape(-1)  # [1920]
 
-            # Clean resample 24kHz → 48kHz (no LavaSR for now)
-            # LavaSR degrades quality on 80ms frames because:
-            #   1) 24→16kHz downsample is lossy
-            #   2) BWE has no context across frame boundaries
-            pcm_2d = pcm.squeeze(0)  # [1, 1920]
-            pcm_48k = torchaudio.functional.resample(pcm_2d, 24000, 48000)  # [1, 3840]
+            # High-quality polyphase resample: 24kHz → 48kHz (ratio = 2/1)
+            if _HAS_SCIPY:
+                pcm_48k = resample_poly(pcm_1d, up=2, down=1).astype(np.float32)
+            else:
+                # Fallback: simple linear interpolation
+                n_out = len(pcm_1d) * 2
+                indices = np.linspace(0, len(pcm_1d) - 1, n_out)
+                pcm_48k = np.interp(indices, np.arange(len(pcm_1d)), pcm_1d).astype(np.float32)
 
-            out_np = pcm_48k.float().cpu().numpy().reshape(1, 1, -1)  # [1, 1, 3840]
+            out_np = pcm_48k.reshape(1, 1, -1)  # [1, 1, 3840]
 
             responses.append(
                 pb_utils.InferenceResponse(
@@ -69,5 +58,4 @@ class TritonPythonModel:
         return responses
 
     def finalize(self):
-        del self.model
-        torch.cuda.empty_cache()
+        pass

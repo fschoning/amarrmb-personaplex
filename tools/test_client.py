@@ -23,8 +23,10 @@ import argparse
 import asyncio
 import base64
 import json
+import queue
 import struct
 import sys
+import threading
 import time
 import wave
 from pathlib import Path
@@ -92,6 +94,40 @@ class PersonaPlexClient:
         self.frames_sent = 0
         self.output_buffer = bytearray()
 
+        # Streaming speaker output (avoids sd.play() restart-per-chunk issue)
+        self._speaker_queue = queue.Queue()
+        self._speaker_stream = None
+        if sd and np:
+            try:
+                self._speaker_stream = sd.OutputStream(
+                    samplerate=OUTPUT_RATE,
+                    channels=1,
+                    dtype='float32',
+                    blocksize=1024,
+                    callback=self._speaker_callback,
+                )
+                self._speaker_stream.start()
+            except Exception as e:
+                print(f"  [speaker] Could not open output stream: {e}")
+                self._speaker_stream = None
+
+    def _speaker_callback(self, outdata, frames, time_info, status):
+        """Sounddevice output callback — pulls audio from the queue."""
+        filled = 0
+        while filled < frames:
+            try:
+                chunk = self._speaker_queue.get_nowait()
+                n = min(len(chunk), frames - filled)
+                outdata[filled:filled + n, 0] = chunk[:n]
+                filled += n
+                if n < len(chunk):
+                    # Put remainder back (front of queue)
+                    self._speaker_queue.put(chunk[n:])
+            except queue.Empty:
+                # No more audio — fill rest with silence
+                outdata[filled:, 0] = 0
+                break
+
     async def connect(self):
         print(f"Connecting to {self.url} ...")
         self.ws = await websockets.connect(
@@ -150,10 +186,10 @@ class PersonaPlexClient:
                     self.audio_received += len(pcm_bytes)
                     self.output_buffer.extend(pcm_bytes)
 
-                    # Play audio if sounddevice available
-                    if sd and np:
+                    # Stream to speaker via queue (continuous, no restarts)
+                    if self._speaker_stream and np:
                         samples = pcm16_bytes_to_float32(pcm_bytes)
-                        sd.play(samples, samplerate=OUTPUT_RATE, blocking=False)
+                        self._speaker_queue.put(samples)
 
                     # Progress indicator
                     ms = (self.audio_received // 2) * 1000 // OUTPUT_RATE
@@ -316,6 +352,12 @@ class PersonaPlexClient:
         print(f"Saved {ms}ms of output audio to {path}")
 
     async def close(self):
+        if self._speaker_stream:
+            # Drain remaining audio before closing
+            await asyncio.sleep(0.5)
+            self._speaker_stream.stop()
+            self._speaker_stream.close()
+            self._speaker_stream = None
         if self.ws:
             await self.ws.close()
 
