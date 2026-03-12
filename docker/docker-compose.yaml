@@ -54,19 +54,16 @@ services:
       dockerfile: docker/Dockerfile.gateway
     image: personaplex-gateway:latest
     restart: unless-stopped
+    network_mode: host
     depends_on:
       triton:
         condition: service_healthy
-    ports:
-      - "${WS_PORT:-8998}:8998"
     environment:
-      TRITON_GRPC_URL:    "triton:8001"
+      TRITON_GRPC_URL:    "localhost:8001"
       MAX_SESSIONS:       "${MAX_SESSIONS:-6}"
       SESSION_TIMEOUT_S:  "${SESSION_TIMEOUT_S:-300}"
-      WS_PORT:            "8998"
+      WS_PORT:            "${WS_PORT:-8998}"
       SSL_CERT:           "${SSL_CERT:-}"
       SSL_KEY:            "${SSL_KEY:-}"
-    volumes:
-      - "${SSL_DIR:-./ssl}:/ssl:ro"
 
 # No named volumes — HF cache is bind-mounted from host via HF_CACHE_DIR env var
