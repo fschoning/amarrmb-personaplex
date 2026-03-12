@@ -5,9 +5,8 @@
 # Upsamples 24kHz PCM [1, 1, 1920] → 48kHz PCM [1, 1, 3840].
 # Stateless — one instance handles all sessions via dynamic batching.
 #
-# To switch to TensorRT after running scripts/export_lavasr.py:
-#   1. Place model.plan in model_repository/lavasr_v2/1/
-#   2. Change backend in config.pbtxt to "tensorrt" and remove model.py
+# Uses ysharma3501/LavaSR from https://github.com/ysharma3501/LavaSR
+# HuggingFace model: YatharthS/LavaSR
 
 import json
 import os
@@ -18,42 +17,35 @@ import torch
 import triton_python_backend_utils as pb_utils
 
 _DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-_HF_REPO = os.environ.get("LAVASR_HF_REPO", "declinator/lava-sr-v2")
+_HF_REPO = os.environ.get("LAVASR_HF_REPO", "YatharthS/LavaSR")
 
 
 class TritonPythonModel:
 
     def initialize(self, args: dict):
         self.logger = pb_utils.Logger
-        self.logger.log_info("lavasr_v2: loading model from HuggingFace...")
+        self.logger.log_info("lavasr_v2: loading model...")
 
         try:
-            # Primary: load via the lavasr package if installed
-            from lavasr import LavaSR  # type: ignore
-            self.model = LavaSR.from_pretrained(_HF_REPO).to(_DEVICE).eval()
+            from LavaSR.model import LavaEnhance2
+            self.model = LavaEnhance2(_HF_REPO, _DEVICE.type)
             self._mode = "lavasr"
-        except ImportError:
-            # Fallback: load as a generic HF model / torch hub
-            self.logger.log_warn(
-                "lavasr package not found; attempting torch.hub.load from "
-                + _HF_REPO
-            )
-            try:
-                self.model = torch.hub.load(
-                    _HF_REPO, "lavasr_v2", pretrained=True
-                ).to(_DEVICE).eval()
-                self._mode = "torchhub"
-            except Exception as e:
-                raise RuntimeError(
-                    f"Cannot load LavaSR v2: {e}\n"
-                    "Install with: pip install git+https://github.com/declinator/lava-sr"
-                ) from e
+            self.logger.log_info(f"lavasr_v2: loaded from {_HF_REPO} (mode=lavasr)")
+        except Exception as e:
+            raise RuntimeError(
+                f"Cannot load LavaSR: {e}\n"
+                "Install with: pip install git+https://github.com/ysharma3501/LavaSR.git"
+            ) from e
 
-        # Compile for SM 12.1 (DGX Spark Blackwell)
+        # Compile for faster inference
         if hasattr(torch, "compile"):
-            self.model = torch.compile(self.model)
+            try:
+                self.model.model = torch.compile(self.model.model)
+                self.logger.log_info("lavasr_v2: model compiled with torch.compile")
+            except Exception:
+                self.logger.log_warn("lavasr_v2: torch.compile failed, using eager mode")
 
-        self.logger.log_info(f"lavasr_v2: loaded (mode={self._mode}).")
+        self.logger.log_info("lavasr_v2: ready.")
 
     @torch.no_grad()
     def execute(self, requests):
@@ -66,12 +58,16 @@ class TritonPythonModel:
 
             pcm = torch.from_numpy(pcm_np).to(_DEVICE)  # [1, 1, 1920]
 
-            # LavaSR v2 accepts a raw waveform tensor and returns 48kHz output.
-            # Input sample rate is passed so the model can adapt.
-            upsampled = self.model(pcm, input_sr=24000, output_sr=48000)
-            # upsampled: [1, 1, 3840]
+            # LavaSR enhance expects [1, samples] or [samples]
+            # Input is [1, 1, 1920] → squeeze to [1920] for enhance()
+            pcm_squeezed = pcm.squeeze()  # [1920]
 
-            out_np = upsampled.float().cpu().numpy()  # [1, 1, 3840]
+            # Enhance: 24kHz → 48kHz
+            upsampled = self.model.enhance(pcm_squeezed)  # returns [1, 3840] or [3840]
+
+            # Reshape to [1, 1, 3840]
+            out = upsampled.float().squeeze()  # [3840]
+            out_np = out.cpu().numpy().reshape(1, 1, -1)  # [1, 1, 3840]
 
             responses.append(
                 pb_utils.InferenceResponse(
