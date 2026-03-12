@@ -17,7 +17,7 @@ import triton_python_backend_utils as pb_utils
 from huggingface_hub import hf_hub_download
 from moshi.models import loaders
 
-_HF_REPO = os.environ.get("HF_REPO", loaders.DEFAULT_REPO)
+_HF_REPO = os.environ.get("HF_REPO", "") or loaders.DEFAULT_REPO
 _DEVICE  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 

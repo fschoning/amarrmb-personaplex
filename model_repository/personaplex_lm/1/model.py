@@ -31,7 +31,7 @@ from moshi.models import loaders
 from moshi.models.lm import LMGen
 from moshi.fp8_quantize import quantize_model
 
-_HF_REPO      = os.environ.get("HF_REPO", loaders.DEFAULT_REPO)
+_HF_REPO      = os.environ.get("HF_REPO", "") or loaders.DEFAULT_REPO
 _DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 _USE_FP8      = os.environ.get("PERSONAPLEX_FP8", "1") == "1"
 _TEMPERATURE  = float(os.environ.get("LM_TEMPERATURE", "0.8"))
