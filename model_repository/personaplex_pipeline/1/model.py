@@ -174,6 +174,9 @@ class TritonPythonModel:
 
         if self._text_prompt_tokens:
             self.lm_gen.text_prompt_tokens = self._text_prompt_tokens
+        else:
+            # Must be an iterable (not None) — _step_text_prompt_core iterates it
+            self.lm_gen.text_prompt_tokens = []
 
         self.lm_gen.step_system_prompts(self.mimi)
 
