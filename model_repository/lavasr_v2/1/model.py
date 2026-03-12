@@ -51,15 +51,14 @@ class TritonPythonModel:
 
             pcm = torch.from_numpy(pcm_np).to(_DEVICE)  # [1, 1, 1920]
 
-            # LavaSR expects 16kHz input, so resample 24kHz → 16kHz first
+            # Clean resample 24kHz → 48kHz (no LavaSR for now)
+            # LavaSR degrades quality on 80ms frames because:
+            #   1) 24→16kHz downsample is lossy
+            #   2) BWE has no context across frame boundaries
             pcm_2d = pcm.squeeze(0)  # [1, 1920]
-            pcm_16k = torchaudio.functional.resample(pcm_2d, 24000, 16000)  # [1, 1280]
+            pcm_48k = torchaudio.functional.resample(pcm_2d, 24000, 48000)  # [1, 3840]
 
-            # Enhance: 16kHz → 48kHz (skip denoiser — 80ms frame too short for FFT)
-            upsampled = self.model.enhance(pcm_16k, denoise=False)  # returns [3840]
-
-            # Reshape to [1, 1, 3840]
-            out_np = upsampled.float().cpu().numpy().reshape(1, 1, -1)  # [1, 1, 3840]
+            out_np = pcm_48k.float().cpu().numpy().reshape(1, 1, -1)  # [1, 1, 3840]
 
             responses.append(
                 pb_utils.InferenceResponse(
