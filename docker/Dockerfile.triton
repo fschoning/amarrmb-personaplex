@@ -9,6 +9,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libsndfile1 libopus-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
+# -----------------------------------------------------------------------
+# Replace the container's CPU-only PyTorch with CUDA 13.0 build
+# The NGC Triton image ships torch 2.10+cpu which has NO GPU support on
+# the DGX Spark (GB10 / Blackwell / sm_121). The +cu130 build from
+# NVIDIA's pip index includes full CUDA 13.0 + Blackwell support.
+# -----------------------------------------------------------------------
+RUN pip uninstall -y torch torchaudio 2>/dev/null; \
+    pip install --no-cache-dir \
+        torch==2.10.0+cu130 \
+        torchaudio \
+        --extra-index-url https://pypi.nvidia.com
+
 WORKDIR /app
 
 # Install moshi Python package (provides MimiModel, LMGen, loaders, fp8_quantize)
