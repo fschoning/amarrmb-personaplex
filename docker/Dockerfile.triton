@@ -17,9 +17,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # -----------------------------------------------------------------------
 RUN pip uninstall -y torch torchaudio 2>/dev/null; \
     pip install --no-cache-dir \
-        torch==2.10.0+cu130 \
-        torchaudio \
-        --extra-index-url https://pypi.nvidia.com
+        torch torchaudio \
+        --index-url https://download.pytorch.org/whl/cu130
 
 WORKDIR /app
 
