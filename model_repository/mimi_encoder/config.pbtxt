@@ -33,7 +33,7 @@ sequence_batching {
 
 instance_group [
   {
-    count: 6
+    count: 1
     kind: KIND_GPU
     gpus: [0]
   }

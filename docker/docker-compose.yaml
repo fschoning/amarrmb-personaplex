@@ -15,7 +15,7 @@ services:
         HF_TOKEN: "${HF_TOKEN:-}"
     image: personaplex-triton:latest
     restart: unless-stopped
-    shm_size: '2gb'
+    shm_size: '4gb'
     ports:
       - "8001:8001"   # gRPC
       - "8000:8000"   # HTTP (diagnostics only)
