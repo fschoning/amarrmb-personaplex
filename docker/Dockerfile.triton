@@ -14,10 +14,12 @@ WORKDIR /app
 COPY moshi/ /app/moshi/
 RUN pip install --no-cache-dir -e /app/moshi/
 
-# Install LavaSR v2
-RUN pip install --no-cache-dir \
-        git+https://github.com/declinator/lava-sr.git || \
-    echo "WARNING: lavasr package not available — Python fallback will use torch.hub"
+# Install LavaSR v2 (required for audio upsampling 24kHz→48kHz)
+RUN pip install --no-cache-dir git+https://github.com/declinator/lava-sr.git
+
+# Pre-cache the torch.hub model so runtime doesn't need internet
+RUN python3 -c "import torch; torch.hub.load('declinator/lava-sr-v2', 'lavasr_v2', pretrained=True)" \
+    || echo "WARN: torch.hub pre-cache failed — will use lavasr package directly"
 
 # Copy model repository and scripts into image
 COPY model_repository/ /models/
