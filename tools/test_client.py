@@ -54,7 +54,7 @@ except ImportError:
 # Audio helpers
 # ---------------------------------------------------------------------------
 INPUT_RATE = 24000   # What the server expects
-OUTPUT_RATE = 48000  # What the server sends back
+OUTPUT_RATE = 24000  # What the server sends back (direct from Mimi decoder)
 FRAME_MS = 80        # Send audio every 80ms
 FRAME_SAMPLES = INPUT_RATE * FRAME_MS // 1000  # 1920
 

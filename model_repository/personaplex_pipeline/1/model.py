@@ -101,25 +101,16 @@ class TritonPythonModel:
         pcm_24k = pb_utils.get_output_tensor_by_name(dec_response, "PCM_24K")
         t3 = time.monotonic()
 
-        # --- Step 4: lavasr_v2 (upsampling 24kHz → 48kHz) ---
-        sr_request = pb_utils.InferenceRequest(
-            model_name="lavasr_v2",
-            inputs=[pcm_24k],
-            requested_output_names=["OUTPUT_PCM_48K"],
-        )
-        sr_response = sr_request.exec()
-        if sr_response.has_error():
-            raise RuntimeError(f"lavasr_v2: {sr_response.error().message()}")
-
-        output_pcm = pb_utils.get_output_tensor_by_name(sr_response, "OUTPUT_PCM_48K")
-        t4 = time.monotonic()
+        # Output 24kHz PCM directly (no upsampling — saves an IPC round-trip)
+        # Keep tensor name "OUTPUT_PCM_48K" for gateway compatibility
+        output_pcm = pb_utils.Tensor("OUTPUT_PCM_48K", pcm_24k.as_numpy())
 
         self._frame_count += 1
         if self._frame_count <= 5 or self._frame_count % 25 == 0:
             self.logger.log_info(
                 f"BLS frame {self._frame_count}: "
-                f"enc={t1-t0:.3f}s lm={t2-t1:.3f}s dec={t3-t2:.3f}s sr={t4-t3:.3f}s "
-                f"total={t4-t0:.3f}s"
+                f"enc={t1-t0:.3f}s lm={t2-t1:.3f}s dec={t3-t2:.3f}s "
+                f"total={t3-t0:.3f}s"
             )
 
         # --- Build response ---
