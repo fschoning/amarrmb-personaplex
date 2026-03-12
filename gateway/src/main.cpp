@@ -81,19 +81,29 @@ static void session_worker(std::shared_ptr<Session> sess,
     // Text prompt tokens (may contain voice name encoded as int32 sentinel)
     std::vector<int32_t> text_tokens = sess->config.text_prompt_tokens;
 
+    fprintf(stderr, "[worker] session %s: voice_bytes=%zu text_tokens=%zu\n",
+            sess->session_id.c_str(), voice_bytes.size(), text_tokens.size());
+
     // --- 3. Triton START (blocks during system prompt conditioning) ---
     std::string resp_id  = "resp_" + sess->session_id;
     std::string item_id  = "item_" + sess->session_id;
 
     TritonSession ts(cfg.triton_url, cfg.pipeline_model, sess->corrid, cfg.model_version);
 
+    fprintf(stderr, "[worker] session %s: sending START to Triton...\n",
+            sess->session_id.c_str());
+
     try {
         bool ok = ts.send_start(voice_bytes, text_tokens);
+        fprintf(stderr, "[worker] session %s: Triton START returned ok=%d\n",
+                sess->session_id.c_str(), ok);
         if (!ok || sess->should_close.load()) {
             send(make_error("server_error", "Triton start failed", ""));
             return;
         }
     } catch (const std::exception& e) {
+        fprintf(stderr, "[worker] session %s: Triton exception: %s\n",
+                sess->session_id.c_str(), e.what());
         send(make_error("server_error", std::string("Triton: ") + e.what(), ""));
         return;
     }
