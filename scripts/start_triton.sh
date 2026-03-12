@@ -22,7 +22,8 @@ exec tritonserver \
     --http-port="${HTTP_PORT}" \
     --metrics-port="${METRICS_PORT}" \
     --log-verbose="${LOG_VERBOSE}" \
-    --model-control-mode=none \
+    --model-control-mode=explicit \
+    --load-model=personaplex_pipeline \
     --strict-readiness=true \
     --exit-on-error=false \
     --backend-config=python,shm-default-byte-size=134217728 \
