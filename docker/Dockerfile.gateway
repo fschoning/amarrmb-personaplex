@@ -1,7 +1,7 @@
 # docker/Dockerfile.gateway
 # Builds the C++ PersonaPlex gateway using the Triton SDK image for libraries
 
-FROM nvcr.io/nvidia/tritonserver:25.02-py3-sdk AS builder
+FROM nvcr.io/nvidia/tritonserver:25.04-py3-sdk AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake ninja-build build-essential git zlib1g-dev libssl-dev \

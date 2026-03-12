@@ -1,7 +1,8 @@
 # docker/Dockerfile.triton
 # Triton server container with moshi + LavaSR dependencies installed
 
-FROM nvcr.io/nvidia/tritonserver:25.02-py3
+# 25.04 = CUDA 12.9 + explicit Blackwell/GB10 (sm_121) support
+FROM nvcr.io/nvidia/tritonserver:25.04-py3
 
 # System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
