@@ -151,12 +151,23 @@ class PersonaPlexClient:
             "top_k": 250,
         }
 
-        # Attach voice prompt if provided
-        if self.voice_prompt_path and Path(self.voice_prompt_path).exists():
-            with open(self.voice_prompt_path, "rb") as f:
-                vp_bytes = f.read()
-            session_cfg["voice_prompt_embedding"] = base64.b64encode(vp_bytes).decode()
-            print(f"  Voice prompt: {self.voice_prompt_path} ({len(vp_bytes)} bytes)")
+        # Attach voice prompt: either a local .pt file or a voice NAME
+        # Voice names (e.g. "NATF0") are sent as short base64 strings;
+        # the server detects the short payload and loads from its HF cache.
+        if self.voice_prompt_path:
+            local_path = Path(self.voice_prompt_path)
+            if local_path.exists() and local_path.suffix == ".pt":
+                # Local .pt file — send full embeddings
+                with open(local_path, "rb") as f:
+                    vp_bytes = f.read()
+                session_cfg["voice_prompt_embedding"] = base64.b64encode(vp_bytes).decode()
+                print(f"  Voice prompt: {local_path.name} ({len(vp_bytes)} bytes)")
+            else:
+                # Voice name — send the name, server loads from HF cache
+                name = local_path.stem if local_path.suffix == ".pt" else self.voice_prompt_path
+                # Base64-encode the voice name as bytes
+                session_cfg["voice_prompt_embedding"] = base64.b64encode(name.encode()).decode()
+                print(f"  Voice: {name} (server-side load)")
 
         msg = json.dumps({"type": "session.update", "session": session_cfg})
         await self.ws.send(msg)
@@ -393,14 +404,9 @@ def get_voices_dir() -> str | None:
     return None
 
 
-def interactive_voice_select(voices_dir: str | None = None) -> str | None:
-    """Show a numbered list of voices and let the user pick one."""
-    if voices_dir is None:
-        voices_dir = get_voices_dir()
-    if voices_dir is None:
-        print("  Voice prompts not found in HF cache.")
-        print("  Use --voice-prompt <path> to specify directly.")
-        return None
+def interactive_voice_select() -> str | None:
+    """Show a numbered list of voices and let the user pick one.
+    Returns the voice NAME (not path) — server loads from its HF cache."""
 
     # Group by category
     categories = [
@@ -416,11 +422,8 @@ def interactive_voice_select(voices_dir: str | None = None) -> str | None:
     for cat_name, names in categories:
         print(f"    ── {cat_name} ──")
         for name in names:
-            pt_path = os.path.join(voices_dir, f"{name}.pt")
-            exists = os.path.exists(pt_path)
-            marker = "" if exists else " (missing)"
-            print(f"    {idx:2d}. {name}{marker}")
-            voice_map[idx] = pt_path
+            print(f"    {idx:2d}. {name}")
+            voice_map[idx] = name
             idx += 1
     print(f"     0. (no voice prompt — use default)")
 
@@ -435,11 +438,11 @@ def interactive_voice_select(voices_dir: str | None = None) -> str | None:
                 return None
             if n in voice_map:
                 selected = voice_map[n]
-                print(f"  Selected: {Path(selected).stem}")
-                return selected
+                print(f"  Selected: {selected}")
+                return selected  # Returns voice NAME, not path
             print(f"  Please enter 0-{idx-1}")
         except (ValueError, EOFError):
-            return list(voice_map.values())[0] if voice_map else None
+            return VOICE_NAMES[0]
 
 
 # ---------------------------------------------------------------------------
@@ -462,9 +465,9 @@ async def main():
     parser.add_argument("--tls", action="store_true", help="Use wss:// instead of ws://")
     args = parser.parse_args()
 
-    # Interactive voice selection
-    if (args.voice or args.voices_dir) and not args.voice_prompt:
-        args.voice_prompt = interactive_voice_select(args.voices_dir)
+    # Interactive voice selection (returns voice NAME, server loads .pt)
+    if args.voice and not args.voice_prompt:
+        args.voice_prompt = interactive_voice_select()
 
     scheme = "wss" if args.tls else "ws"
     url = f"{scheme}://{args.host}:{args.port}/v1/realtime"

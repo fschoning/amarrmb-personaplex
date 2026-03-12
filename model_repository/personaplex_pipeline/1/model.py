@@ -124,6 +124,30 @@ class TritonPythonModel:
         self.logger.log_info("personaplex_pipeline: ready.")
 
     # ------------------------------------------------------------------
+    # Voice name resolution
+    # ------------------------------------------------------------------
+
+    def _resolve_voice_name(self, name: str) -> str | None:
+        """Resolve a voice name (e.g. 'NATF0') to the .pt file path in HF cache."""
+        # Look in the HF cache for the PersonaPlex voices directory
+        hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+        voices_base = os.path.join(hf_home, "hub")
+
+        # Search for the voices directory in any PersonaPlex snapshot
+        for root, dirs, files in os.walk(voices_base):
+            if os.path.basename(root) == "voices":
+                pt_path = os.path.join(root, f"{name}.pt")
+                if os.path.exists(pt_path):
+                    return pt_path
+
+        # Also check a direct path
+        direct = os.path.join(voices_base, "voices", f"{name}.pt")
+        if os.path.exists(direct):
+            return direct
+
+        return None
+
+    # ------------------------------------------------------------------
     # System prompt conditioning
     # ------------------------------------------------------------------
 
@@ -131,14 +155,25 @@ class TritonPythonModel:
         self.mimi.reset_streaming()
 
         if self._voice_prompt_bytes:
-            with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
-                f.write(self._voice_prompt_bytes)
-                tmp_path = f.name
-            self.lm_gen.load_voice_prompt_embeddings(tmp_path)
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+            # Short payload (<100 bytes) = voice NAME, load from HF cache
+            # Long payload = raw .pt embeddings from client
+            if len(self._voice_prompt_bytes) < 100:
+                voice_name = self._voice_prompt_bytes.decode("utf-8", errors="ignore").strip()
+                voice_path = self._resolve_voice_name(voice_name)
+                if voice_path:
+                    self.logger.log_info(f"personaplex_pipeline: loading voice '{voice_name}'")
+                    self.lm_gen.load_voice_prompt_embeddings(voice_path)
+                else:
+                    self.logger.log_info(f"personaplex_pipeline: voice '{voice_name}' not found")
+            else:
+                with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
+                    f.write(self._voice_prompt_bytes)
+                    tmp_path = f.name
+                self.lm_gen.load_voice_prompt_embeddings(tmp_path)
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
         if self._text_prompt_tokens:
             self.lm_gen.text_prompt_tokens = self._text_prompt_tokens
