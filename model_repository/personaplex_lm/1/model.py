@@ -13,7 +13,6 @@
 # All 6 instances share a single Mimi model for system-prompt encoding
 # (protected by a threading.Lock — only one system prompt runs at a time).
 
-import asyncio
 import json
 import os
 import tempfile
@@ -118,12 +117,10 @@ class TritonPythonModel:
             if self._text_prompt_tokens:
                 self.lm_gen.text_prompt_tokens = self._text_prompt_tokens
 
-            # Run the synchronous wrapper of step_system_prompts_async.
-            # asyncio.run() is safe here — Triton execute() runs in a thread pool,
-            # not in an event loop.
-            asyncio.run(
-                self.lm_gen.step_system_prompts_async(mimi, is_alive=lambda: True)
-            )
+            # Run system prompt conditioning (blocking, ~2-5s).
+            # Use the synchronous path — async version requires a coroutine
+            # for is_alive, which isn't needed in Triton (it manages timeouts).
+            self.lm_gen.step_system_prompts(mimi)
 
     # ------------------------------------------------------------------
 
