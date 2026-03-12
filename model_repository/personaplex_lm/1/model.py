@@ -67,6 +67,7 @@ class TritonPythonModel:
 
         lm_weight = hf_hub_download(_HF_REPO, loaders.MOSHI_NAME)
         lm = loaders.get_moshi_lm(lm_weight, device=_DEVICE)
+        lm.eval()   # CRITICAL: disable dropout/batchnorm for inference
 
         if _USE_FP8:
             self.logger.log_info("personaplex_lm: applying FP8 quantisation...")
@@ -84,6 +85,31 @@ class TritonPythonModel:
             top_k=_TOP_K,
         )
         self.lm_gen.streaming_forever(1)
+
+        # Warmup: 4 rounds of encode → step → decode to trigger CUDA kernel compilation
+        # Without this, the first real frames suffer massive JIT compilation overhead.
+        self.logger.log_info("personaplex_lm: warming up (4 rounds)...")
+        mimi = _get_shared_mimi()
+        input_dtype = torch.float16 if _USE_FP8 else torch.float32
+        frame_size = int(mimi.sample_rate / mimi.frame_rate)
+        for _ in range(4):
+            chunk = torch.zeros(1, 1, frame_size, dtype=input_dtype, device=_DEVICE)
+            codes = mimi.encode(chunk)
+            for c in range(codes.shape[-1]):
+                tokens = self.lm_gen.step(codes[:, :, c:c + 1])
+                if tokens is not None:
+                    _ = mimi.decode(tokens[:, 1:9])
+        if _DEVICE.type == "cuda":
+            torch.cuda.synchronize()
+
+        # After warmup with FP8, free BF16 input projection weights to save memory
+        if _USE_FP8:
+            try:
+                from moshi.fp8_quantize import free_bf16_inproj
+                free_bf16_inproj(lm)
+                self.logger.log_info("personaplex_lm: freed BF16 inproj weights")
+            except ImportError:
+                pass
 
         # Session state populated on each START
         self._voice_prompt_bytes: Optional[bytes] = None
