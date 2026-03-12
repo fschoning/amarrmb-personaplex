@@ -39,6 +39,18 @@ class TritonPythonModel:
 
         self.mimi.streaming_forever(1)
 
+        # Warmup: trigger torch.compile JIT + CUDA kernel caching
+        # Without this, first 3 real frames take 1.5-3.6s each
+        self.logger.log_info("mimi_decoder: warming up (4 rounds)...")
+        frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
+        for _ in range(4):
+            chunk = torch.zeros(1, 1, frame_size, dtype=torch.float16, device=_DEVICE)
+            codes = self.mimi.encode(chunk)
+            _ = self.mimi.decode(codes[:, :8, :])
+        if _DEVICE.type == "cuda":
+            torch.cuda.synchronize()
+        self.logger.log_info("mimi_decoder: warmup done.")
+
         self.logger.log_info("mimi_decoder: ready.")
 
     @torch.no_grad()
