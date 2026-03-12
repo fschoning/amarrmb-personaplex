@@ -20,6 +20,7 @@ services:
       - "8000:8000"   # HTTP (diagnostics only)
       - "8002:8002"   # Prometheus metrics
     environment:
+      MODEL_REPO:          "/models"
       HF_REPO:           "${HF_REPO:-}"
       HF_TOKEN:          "${HF_TOKEN:-}"
       LAVASR_HF_REPO:    "${LAVASR_HF_REPO:-declinator/lava-sr-v2}"
