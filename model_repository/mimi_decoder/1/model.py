@@ -39,8 +39,10 @@ class TritonPythonModel:
 
         self.mimi.streaming_forever(1)
 
-        # Per-instance pinned CPU buffer for DtoH transfer (avoids race between instances)
-        self._pinned_pcm = torch.empty(1920, dtype=torch.float32, pin_memory=True)
+        # Per-instance CPU buffer for DtoH transfer
+        # Note: pin_memory not available on unified-memory systems (DGX Spark)
+        _can_pin = torch.cuda.is_available() and hasattr(torch.cuda, 'CudaError')
+        self._pinned_pcm = torch.empty(1920, dtype=torch.float32, pin_memory=False)
         self.logger.log_info("mimi_decoder: ready.")
 
     @torch.no_grad()
