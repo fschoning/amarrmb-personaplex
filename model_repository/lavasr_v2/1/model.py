@@ -13,6 +13,7 @@ import os
 
 import numpy as np
 import torch
+import torchaudio
 
 import triton_python_backend_utils as pb_utils
 
@@ -37,14 +38,6 @@ class TritonPythonModel:
                 "Install with: pip install git+https://github.com/ysharma3501/LavaSR.git"
             ) from e
 
-        # Compile for faster inference
-        if hasattr(torch, "compile"):
-            try:
-                self.model.model = torch.compile(self.model.model)
-                self.logger.log_info("lavasr_v2: model compiled with torch.compile")
-            except Exception:
-                self.logger.log_warn("lavasr_v2: torch.compile failed, using eager mode")
-
         self.logger.log_info("lavasr_v2: ready.")
 
     @torch.no_grad()
@@ -58,16 +51,15 @@ class TritonPythonModel:
 
             pcm = torch.from_numpy(pcm_np).to(_DEVICE)  # [1, 1, 1920]
 
-            # LavaSR enhance expects [1, samples] or [samples]
-            # Input is [1, 1, 1920] → squeeze to [1920] for enhance()
-            pcm_squeezed = pcm.squeeze()  # [1920]
+            # LavaSR expects 16kHz input, so resample 24kHz → 16kHz first
+            pcm_2d = pcm.squeeze(0)  # [1, 1920]
+            pcm_16k = torchaudio.functional.resample(pcm_2d, 24000, 16000)  # [1, 1280]
 
-            # Enhance: 24kHz → 48kHz
-            upsampled = self.model.enhance(pcm_squeezed)  # returns [1, 3840] or [3840]
+            # Enhance: 16kHz → 48kHz (skip denoiser — 80ms frame too short for FFT)
+            upsampled = self.model.enhance(pcm_16k, denoise=False)  # returns [3840]
 
             # Reshape to [1, 1, 3840]
-            out = upsampled.float().squeeze()  # [3840]
-            out_np = out.cpu().numpy().reshape(1, 1, -1)  # [1, 1, 3840]
+            out_np = upsampled.float().cpu().numpy().reshape(1, 1, -1)  # [1, 1, 3840]
 
             responses.append(
                 pb_utils.InferenceResponse(
