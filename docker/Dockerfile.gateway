@@ -19,10 +19,10 @@ RUN cmake -GNinja -B build_dir \
     && cmake --build build_dir --target personaplex_gateway -j$(nproc)
 
 # ---
-FROM ubuntu:22.04 AS runtime
+FROM ubuntu:24.04 AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libssl3 zlib1g ca-certificates \
+        libssl3t64 zlib1g ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy binary and runtime libs from builder
