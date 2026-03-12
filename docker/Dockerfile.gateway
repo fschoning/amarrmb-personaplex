@@ -35,4 +35,8 @@ RUN mkdir -p /ssl
 
 EXPOSE 8998
 
-ENTRYPOINT ["/usr/local/bin/personaplex_gateway"]
+# Install stdbuf for line-buffered logging in Docker
+RUN apt-get update && apt-get install -y --no-install-recommends coreutils \
+    && rm -rf /var/lib/apt/lists/*
+
+ENTRYPOINT ["stdbuf", "-oL", "-eL", "/usr/local/bin/personaplex_gateway"]

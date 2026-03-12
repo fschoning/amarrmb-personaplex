@@ -7,6 +7,7 @@
 # Chains: mimi_encoder → personaplex_lm → mimi_decoder → lavasr_v2
 # Supports sequence batching (START/END/CORRID managed by Triton).
 
+import time
 import numpy as np
 import triton_python_backend_utils as pb_utils
 
@@ -15,6 +16,7 @@ class TritonPythonModel:
 
     def initialize(self, args: dict):
         self.logger = pb_utils.Logger
+        self._frame_count = 0
         self.logger.log_info("personaplex_pipeline BLS: initialized")
 
     def execute(self, requests):
@@ -44,6 +46,8 @@ class TritonPythonModel:
         # Determine sequence flags from the request
         flags = request.flags()
 
+        t0 = time.monotonic()
+
         # --- Step 1: mimi_encoder ---
         enc_request = pb_utils.InferenceRequest(
             model_name="mimi_encoder",
@@ -57,6 +61,7 @@ class TritonPythonModel:
             raise RuntimeError(f"mimi_encoder: {enc_response.error().message()}")
 
         codes = pb_utils.get_output_tensor_by_name(enc_response, "CODES")
+        t1 = time.monotonic()
 
         # --- Step 2: personaplex_lm ---
         lm_inputs = [codes, corrid_t, start_t, end_t]
@@ -79,6 +84,7 @@ class TritonPythonModel:
         tokens       = pb_utils.get_output_tensor_by_name(lm_response, "TOKENS")
         text_token   = pb_utils.get_output_tensor_by_name(lm_response, "TEXT_TOKEN")
         session_rdy  = pb_utils.get_output_tensor_by_name(lm_response, "SESSION_READY")
+        t2 = time.monotonic()
 
         # --- Step 3: mimi_decoder ---
         dec_request = pb_utils.InferenceRequest(
@@ -93,6 +99,7 @@ class TritonPythonModel:
             raise RuntimeError(f"mimi_decoder: {dec_response.error().message()}")
 
         pcm_24k = pb_utils.get_output_tensor_by_name(dec_response, "PCM_24K")
+        t3 = time.monotonic()
 
         # --- Step 4: lavasr_v2 (upsampling 24kHz → 48kHz) ---
         sr_request = pb_utils.InferenceRequest(
@@ -105,6 +112,15 @@ class TritonPythonModel:
             raise RuntimeError(f"lavasr_v2: {sr_response.error().message()}")
 
         output_pcm = pb_utils.get_output_tensor_by_name(sr_response, "OUTPUT_PCM_48K")
+        t4 = time.monotonic()
+
+        self._frame_count += 1
+        if self._frame_count <= 5 or self._frame_count % 25 == 0:
+            self.logger.log_info(
+                f"BLS frame {self._frame_count}: "
+                f"enc={t1-t0:.3f}s lm={t2-t1:.3f}s dec={t3-t2:.3f}s sr={t4-t3:.3f}s "
+                f"total={t4-t0:.3f}s"
+            )
 
         # --- Build response ---
         return pb_utils.InferenceResponse(
