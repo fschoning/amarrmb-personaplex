@@ -15,6 +15,7 @@ services:
         HF_TOKEN: "${HF_TOKEN:-}"
     image: personaplex-triton:latest
     restart: unless-stopped
+    shm_size: '2gb'
     ports:
       - "8001:8001"   # gRPC
       - "8000:8000"   # HTTP (diagnostics only)
@@ -28,7 +29,7 @@ services:
       LM_TEMPERATURE:    "${LM_TEMPERATURE:-0.8}"
       LM_TOP_K:          "${LM_TOP_K:-250}"
     volumes:
-      - hf_cache:/root/.cache/huggingface   # persists weight downloads
+      - ${HF_CACHE_DIR:-/mnt/models/hf-cache}:/root/.cache/huggingface   # bind-mount existing HF cache
     deploy:
       resources:
         reservations:
@@ -67,5 +68,4 @@ services:
     volumes:
       - "${SSL_DIR:-./ssl}:/ssl:ro"
 
-volumes:
-  hf_cache:
+# No named volumes — HF cache is bind-mounted from host via HF_CACHE_DIR env var

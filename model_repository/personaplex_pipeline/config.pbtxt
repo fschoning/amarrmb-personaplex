@@ -7,7 +7,7 @@ input [
   { name: "CORRID"                 data_type: TYPE_INT64  dims: [1] },
   { name: "START"                  data_type: TYPE_FP32   dims: [1] },
   { name: "END"                    data_type: TYPE_FP32   dims: [1] },
-  { name: "VOICE_PROMPT_BYTES"     data_type: TYPE_BYTES  dims: [1] },
+  { name: "VOICE_PROMPT_BYTES"     data_type: TYPE_STRING  dims: [1] },
   { name: "TEXT_PROMPT_TOKENS"     data_type: TYPE_INT32  dims: [-1] }
 ]
 
