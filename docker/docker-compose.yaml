@@ -25,7 +25,7 @@ services:
       MODEL_REPO:          "/models"
       HF_REPO:           "${HF_REPO:-}"
       HF_TOKEN:          "${HF_TOKEN:-}"
-      LAVASR_HF_REPO:    "${LAVASR_HF_REPO:-declinator/lava-sr-v2}"
+      LAVASR_HF_REPO:    "${LAVASR_HF_REPO:-YatharthS/LavaSR}"
       PERSONAPLEX_FP8:   "${PERSONAPLEX_FP8:-1}"
       LM_TEMPERATURE:    "${LM_TEMPERATURE:-0.8}"
       LM_TOP_K:          "${LM_TOP_K:-250}"
