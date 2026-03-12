@@ -144,6 +144,16 @@ bool parse_client_event(const char* data, size_t len, ClientEvent& out) {
         if (sess["top_k"].get(itmp) == simdjson::SUCCESS)
             out.session.top_k = static_cast<int>(itmp);
 
+        // Parse text_prompt_tokens array (used for voice name delivery)
+        simdjson::ondemand::array tok_arr;
+        if (sess["text_prompt_tokens"].get_array().get(tok_arr) == simdjson::SUCCESS) {
+            for (auto val : tok_arr) {
+                int64_t v;
+                if (val.get_int64().get(v) == simdjson::SUCCESS)
+                    out.session.text_prompt_tokens.push_back(static_cast<int32_t>(v));
+            }
+        }
+
     } else if (type_str == "input_audio_buffer.append") {
         out.type = ClientEventType::InputAudioBufferAppend;
         std::string_view sv;

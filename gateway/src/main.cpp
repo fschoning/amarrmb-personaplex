@@ -78,10 +78,8 @@ static void session_worker(std::shared_ptr<Session> sess,
         voice_bytes = base64_decode(sess->config.voice_prompt_embedding);
     }
 
-    // Build text prompt tokens (simplified: send raw instructions string bytes for now)
-    // A production implementation would tokenise via moshi's SentencePiece tokeniser.
-    // For Triton, the LM backend receives the bytes and tokenises server-side if tokens=empty.
-    std::vector<int32_t> text_tokens; // empty → LM backend will use instructions string
+    // Text prompt tokens (may contain voice name encoded as int32 sentinel)
+    std::vector<int32_t> text_tokens = sess->config.text_prompt_tokens;
 
     // --- 3. Triton START (blocks during system prompt conditioning) ---
     std::string resp_id  = "resp_" + sess->session_id;

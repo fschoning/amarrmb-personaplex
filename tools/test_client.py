@@ -152,21 +152,21 @@ class PersonaPlexClient:
         }
 
         # Attach voice prompt: either a local .pt file or a voice NAME
-        # Voice names (e.g. "NATF0") are sent as short base64 strings;
-        # the server detects the short payload and loads from its HF cache.
         if self.voice_prompt_path:
             local_path = Path(self.voice_prompt_path)
             if local_path.exists() and local_path.suffix == ".pt":
-                # Local .pt file — send full embeddings
+                # Local .pt file — send full embeddings via voice_prompt_embedding
                 with open(local_path, "rb") as f:
                     vp_bytes = f.read()
                 session_cfg["voice_prompt_embedding"] = base64.b64encode(vp_bytes).decode()
                 print(f"  Voice prompt: {local_path.name} ({len(vp_bytes)} bytes)")
             else:
-                # Voice name — send the name, server loads from HF cache
+                # Voice name — encode as ASCII int32 tokens via text_prompt_tokens
+                # Prefix with sentinel -999 so pipeline can detect it's a voice name
+                # (real SentencePiece tokens are always >= 0)
                 name = local_path.stem if local_path.suffix == ".pt" else self.voice_prompt_path
-                # Base64-encode the voice name as bytes
-                session_cfg["voice_prompt_embedding"] = base64.b64encode(name.encode()).decode()
+                ascii_tokens = [-999] + [ord(c) for c in name]
+                session_cfg["text_prompt_tokens"] = ascii_tokens
                 print(f"  Voice: {name} (server-side load)")
 
         msg = json.dumps({"type": "session.update", "session": session_cfg})

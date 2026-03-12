@@ -27,6 +27,7 @@ enum class ClientEventType {
 struct SessionConfig {
     std::string              instructions;           // text system prompt
     std::string              voice_prompt_embedding; // base64-encoded .pt bytes
+    std::vector<int32_t>     text_prompt_tokens;     // optional: voice name as int32 sentinel
     std::string              input_audio_format  = "pcm16";
     std::string              output_audio_format = "pcm16";
     float                    temperature         = 0.8f;

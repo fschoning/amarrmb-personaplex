@@ -154,26 +154,23 @@ class TritonPythonModel:
     def _run_system_prompts(self):
         self.mimi.reset_streaming()
 
-        if self._voice_prompt_bytes:
-            # Short payload (<100 bytes) = voice NAME, load from HF cache
-            # Long payload = raw .pt embeddings from client
-            if len(self._voice_prompt_bytes) < 100:
-                voice_name = self._voice_prompt_bytes.decode("utf-8", errors="ignore").strip()
-                voice_path = self._resolve_voice_name(voice_name)
-                if voice_path:
-                    self.logger.log_info(f"personaplex_pipeline: loading voice '{voice_name}'")
-                    self.lm_gen.load_voice_prompt_embeddings(voice_path)
-                else:
-                    self.logger.log_info(f"personaplex_pipeline: voice '{voice_name}' not found")
+        # Voice loading: name-based (from tokens) or binary (from voice_prompt_bytes)
+        if hasattr(self, '_voice_name') and self._voice_name:
+            voice_path = self._resolve_voice_name(self._voice_name)
+            if voice_path:
+                self.logger.log_info(f"personaplex_pipeline: loading voice '{self._voice_name}'")
+                self.lm_gen.load_voice_prompt_embeddings(voice_path)
             else:
-                with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
-                    f.write(self._voice_prompt_bytes)
-                    tmp_path = f.name
-                self.lm_gen.load_voice_prompt_embeddings(tmp_path)
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
+                self.logger.log_info(f"personaplex_pipeline: voice '{self._voice_name}' not found")
+        elif self._voice_prompt_bytes:
+            with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
+                f.write(self._voice_prompt_bytes)
+                tmp_path = f.name
+            self.lm_gen.load_voice_prompt_embeddings(tmp_path)
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
         if self._text_prompt_tokens:
             self.lm_gen.text_prompt_tokens = self._text_prompt_tokens
@@ -250,18 +247,29 @@ class TritonPythonModel:
             self._active = True
             self._frame_count = 0
 
-            # Extract voice prompt
+            # Extract voice prompt (binary .pt via voice_prompt_embedding)
             vp_tensor = pb_utils.get_input_tensor_by_name(request, "VOICE_PROMPT_BYTES")
             if vp_tensor is not None:
                 raw = vp_tensor.as_numpy()
                 if raw.size > 0:
                     self._voice_prompt_bytes = raw.flat[0]
 
-            # Extract text prompt
+            # Extract text prompt tokens — may contain voice name
+            # Convention: [-999, ascii, ascii, ...] = voice name (e.g. [-999, 78,65,84,70,50] = "NATF2")
+            # Normal SentencePiece tokens are always >= 0
+            self._voice_name = None
             tp_tensor = pb_utils.get_input_tensor_by_name(request, "TEXT_PROMPT_TOKENS")
             if tp_tensor is not None:
-                tok = tp_tensor.as_numpy()
-                self._text_prompt_tokens = tok.tolist() if tok.size > 0 else None
+                tok = tp_tensor.as_numpy().flatten()
+                if tok.size > 1 and tok[0] == -999:
+                    # Voice name encoded as ASCII int32
+                    self._voice_name = "".join(chr(c) for c in tok[1:] if 32 <= c < 128)
+                    self._text_prompt_tokens = None
+                    self.logger.log_info(f"personaplex_pipeline: voice name from tokens: '{self._voice_name}'")
+                elif tok.size > 0:
+                    self._text_prompt_tokens = tok.tolist()
+                else:
+                    self._text_prompt_tokens = None
 
             self.logger.log_info("personaplex_pipeline: running system prompts...")
             self._run_system_prompts()
