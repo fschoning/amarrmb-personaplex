@@ -14,7 +14,6 @@
 # (protected by a threading.Lock — only one system prompt runs at a time).
 
 import asyncio
-import io
 import json
 import os
 import tempfile
@@ -22,10 +21,12 @@ import threading
 from typing import Optional
 
 import numpy as np
+import sentencepiece
 import torch
 
 import triton_python_backend_utils as pb_utils
 
+from huggingface_hub import hf_hub_download
 from moshi.models import loaders
 from moshi.models.lm import LMGen
 from moshi.fp8_quantize import quantize_model
@@ -47,7 +48,7 @@ def _get_shared_mimi():
     global _shared_mimi
     with _shared_mimi_lock:
         if _shared_mimi is None:
-            mimi_weight = loaders.get_mimi_weight_path(_HF_REPO)
+            mimi_weight = hf_hub_download(_HF_REPO, loaders.MIMI_NAME)
             m = loaders.get_mimi(mimi_weight, _DEVICE)
             m = m.half()
             m.torch_compile_encoder_decoder = True
@@ -65,12 +66,16 @@ class TritonPythonModel:
         self.logger = pb_utils.Logger
         self.logger.log_info("personaplex_lm: loading LM weights (this takes a moment)...")
 
-        lm_weight = loaders.get_moshi_weight_path(_HF_REPO)
-        lm, tokenizer = loaders.get_moshi(lm_weight, _DEVICE)
+        lm_weight = hf_hub_download(_HF_REPO, loaders.MOSHI_NAME)
+        lm = loaders.get_moshi_lm(lm_weight, device=_DEVICE)
 
         if _USE_FP8:
             self.logger.log_info("personaplex_lm: applying FP8 quantisation...")
-            lm = quantize_model(lm)
+            quantize_model(lm)
+
+        # Load text tokenizer
+        tokenizer_path = hf_hub_download(_HF_REPO, loaders.TEXT_TOKENIZER_NAME)
+        self.text_tokenizer = sentencepiece.SentencePieceProcessor(tokenizer_path)
 
         # Create a streaming LMGen wrapper (mirrors server.py)
         self.lm_gen = LMGen(
@@ -79,7 +84,6 @@ class TritonPythonModel:
             temp=_TEMPERATURE,
             top_k=_TOP_K,
         )
-        self.text_tokenizer = tokenizer
         self.lm_gen.streaming_forever(1)
 
         # Session state populated on each START
@@ -160,7 +164,7 @@ class TritonPythonModel:
                 if vp_tensor is not None:
                     raw = vp_tensor.as_numpy()
                     if raw.size > 0:
-                        # TYPE_BYTES comes as numpy object array of bytes items
+                        # TYPE_STRING comes as numpy object array of bytes items
                         self._voice_prompt_bytes = raw.flat[0]
 
                 # Extract optional text prompt tokens
@@ -219,7 +223,7 @@ class TritonPythonModel:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _make_response(tokens, text_token, ready) -> pb_utils.InferenceResponse:
+    def _make_response(tokens, text_token, ready):
         return pb_utils.InferenceResponse(output_tensors=[
             pb_utils.Tensor("TOKENS",        tokens),
             pb_utils.Tensor("TEXT_TOKEN",    text_token),

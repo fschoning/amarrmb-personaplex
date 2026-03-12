@@ -13,12 +13,16 @@ import torch
 
 import triton_python_backend_utils as pb_utils
 
+from huggingface_hub import hf_hub_download
 from moshi.models import loaders
 
 _HF_REPO = os.environ.get("HF_REPO", loaders.DEFAULT_REPO)
 _DEVICE  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def _get_mimi_weight_path():
+    """Download Mimi weights from HuggingFace if not cached."""
+    return hf_hub_download(_HF_REPO, loaders.MIMI_NAME)
 
 
 class TritonPythonModel:
@@ -27,7 +31,7 @@ class TritonPythonModel:
         self.logger = pb_utils.Logger
         self.logger.log_info("mimi_decoder: loading Mimi weights...")
 
-        mimi_weight = loaders.get_mimi_weight_path(_HF_REPO)
+        mimi_weight = _get_mimi_weight_path()
         self.mimi = loaders.get_mimi(mimi_weight, _DEVICE)
         self.mimi = self.mimi.half()
         self.mimi.torch_compile_encoder_decoder = True
