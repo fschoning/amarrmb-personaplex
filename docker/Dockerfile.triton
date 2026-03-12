@@ -24,13 +24,7 @@ COPY model_repository/ /models/
 COPY scripts/ /app/scripts/
 RUN chmod +x /app/scripts/*.sh
 
-# Pre-warm HuggingFace weights (downloads Mimi + Moshi checkpoint)
-ARG HF_TOKEN=""
-ENV HF_TOKEN=${HF_TOKEN}
-RUN if [ -n "${HF_TOKEN}" ]; then \
-        python -c "from moshi.models import loaders; loaders.get_mimi_weight_path(); loaders.get_moshi_weight_path()"; \
-    else \
-        echo "HF_TOKEN not set — weights will download on first run"; \
-    fi
+# HF_TOKEN is passed at runtime via docker-compose environment, not needed at build time.
+# Weights are bind-mounted from the host HF cache at runtime.
 
 ENTRYPOINT ["/app/scripts/start_triton.sh"]

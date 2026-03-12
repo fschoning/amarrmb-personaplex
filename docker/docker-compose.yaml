@@ -11,8 +11,6 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.triton
-      args:
-        HF_TOKEN: "${HF_TOKEN:-}"
     image: personaplex-triton:latest
     restart: unless-stopped
     shm_size: '4gb'
