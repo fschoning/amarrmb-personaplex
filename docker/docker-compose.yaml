@@ -14,6 +14,9 @@ services:
     image: personaplex-triton:latest
     restart: unless-stopped
     shm_size: '4gb'
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
     ports:
       - "8001:8001"   # gRPC
       - "8000:8000"   # HTTP (diagnostics only)
@@ -36,7 +39,7 @@ services:
               count: 1
               capabilities: [gpu]
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8000/v2/health/ready"]
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/v2/health/live"]
       interval: 15s
       timeout: 10s
       retries: 12
