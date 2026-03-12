@@ -94,16 +94,19 @@ class PersonaPlexClient:
         self.frames_sent = 0
         self.output_buffer = bytearray()
 
-        # Streaming speaker output (avoids sd.play() restart-per-chunk issue)
+        # Streaming speaker output with pre-buffering to avoid clicks
         self._speaker_queue = queue.Queue()
         self._speaker_stream = None
+        self._speaker_started = False
+        self._prebuffer_count = 3  # wait for N chunks before starting playback
+        self._prebuffer = []
         if sd and np:
             try:
                 self._speaker_stream = sd.OutputStream(
                     samplerate=OUTPUT_RATE,
                     channels=1,
                     dtype='float32',
-                    blocksize=1024,
+                    blocksize=2048,   # larger blocks = fewer callbacks = fewer underruns
                     callback=self._speaker_callback,
                 )
                 self._speaker_stream.start()
@@ -189,7 +192,16 @@ class PersonaPlexClient:
                     # Stream to speaker via queue (continuous, no restarts)
                     if self._speaker_stream and np:
                         samples = pcm16_bytes_to_float32(pcm_bytes)
-                        self._speaker_queue.put(samples)
+                        if not self._speaker_started:
+                            # Pre-buffer to avoid initial underrun clicks
+                            self._prebuffer.append(samples)
+                            if len(self._prebuffer) >= self._prebuffer_count:
+                                for buf in self._prebuffer:
+                                    self._speaker_queue.put(buf)
+                                self._prebuffer.clear()
+                                self._speaker_started = True
+                        else:
+                            self._speaker_queue.put(samples)
 
                     # Progress indicator
                     ms = (self.audio_received // 2) * 1000 // OUTPUT_RATE
@@ -363,6 +375,47 @@ class PersonaPlexClient:
 
 
 # ---------------------------------------------------------------------------
+# Voice selection helpers
+# ---------------------------------------------------------------------------
+def find_voice_prompts(voices_dir: str) -> list[Path]:
+    """Find all .pt voice prompt files in a directory."""
+    vdir = Path(voices_dir)
+    if not vdir.exists():
+        return []
+    return sorted(vdir.glob("*.pt"))
+
+
+def interactive_voice_select(voices_dir: str) -> str | None:
+    """Show a numbered list of voices and let the user pick one."""
+    voices = find_voice_prompts(voices_dir)
+    if not voices:
+        print(f"  No .pt voice files found in {voices_dir}")
+        return None
+
+    print(f"\n  Available voices ({len(voices)}):")
+    for i, v in enumerate(voices, 1):
+        print(f"    {i:2d}. {v.stem}")
+    print(f"    {0:2d}. (no voice prompt — use default)")
+
+    while True:
+        try:
+            choice = input(f"\n  Select voice [1-{len(voices)}, 0=default]: ").strip()
+            if not choice:
+                idx = 1  # default to first voice
+            else:
+                idx = int(choice)
+            if idx == 0:
+                return None
+            if 1 <= idx <= len(voices):
+                selected = voices[idx - 1]
+                print(f"  Selected: {selected.stem}")
+                return str(selected)
+            print(f"  Please enter 0-{len(voices)}")
+        except (ValueError, EOFError):
+            return str(voices[0]) if voices else None
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 async def main():
@@ -371,12 +424,18 @@ async def main():
     parser.add_argument("--port", type=int, default=8998, help="Gateway port")
     parser.add_argument("--prompt", default="", help="System prompt / instructions")
     parser.add_argument("--voice-prompt", default=None, help="Path to .pt voice prompt file")
+    parser.add_argument("--voices-dir", default=None,
+                        help="Directory containing .pt voice files (enables interactive picker)")
     parser.add_argument("--wav", default=None, help="Path to .wav file to send (mono)")
     parser.add_argument("--loopback", action="store_true", help="Send silence (protocol test)")
     parser.add_argument("--duration", type=float, default=10.0, help="Loopback/mic duration (s)")
     parser.add_argument("--save", default=None, help="Save output audio to .wav file")
     parser.add_argument("--tls", action="store_true", help="Use wss:// instead of ws://")
     args = parser.parse_args()
+
+    # Interactive voice selection
+    if args.voices_dir and not args.voice_prompt:
+        args.voice_prompt = interactive_voice_select(args.voices_dir)
 
     scheme = "wss" if args.tls else "ws"
     url = f"{scheme}://{args.host}:{args.port}/v1/realtime"
