@@ -40,5 +40,16 @@ instance_group [
     count: 2
     kind: KIND_GPU
     gpus: [0]
+    rate_limiter {
+      # Priority 1 = highest.  PersonaPlex audio MUST preempt brain.
+      priority: 1
+      resources [
+        {
+          name: "gpu_compute"
+          global: true
+          count: 1
+        }
+      ]
+    }
   }
 ]

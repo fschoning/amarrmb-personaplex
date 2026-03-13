@@ -36,4 +36,5 @@ exec tritonserver \
     --strict-readiness=true \
     --exit-on-error=false \
     --backend-config=python,shm-default-byte-size=134217728 \
+    --rate-limit=execution_count \
     "$@"

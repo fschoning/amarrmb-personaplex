@@ -11,12 +11,24 @@ output [
   { name: "RESPONSE"   data_type: TYPE_STRING  dims: [1] }
 ]
 
-# Single instance — Mixtral runs one request at a time
-# Lower priority than personaplex_pipeline (real-time audio)
+# Single instance — brain runs one request at a time
+# Priority 10 = LOWEST. PersonaPlex audio (priority 1) always preempts.
+# Both models compete for the same "gpu_compute" token — Triton schedules
+# the higher-priority model first when contention occurs.
 instance_group [
   {
     count: 1
     kind: KIND_GPU
     gpus: [0]
+    rate_limiter {
+      priority: 10
+      resources [
+        {
+          name: "gpu_compute"
+          global: true
+          count: 1
+        }
+      ]
+    }
   }
 ]

@@ -138,17 +138,10 @@ void Orchestrator::run() {
         // ── Pop 80ms of PCM from ring buffer ──────────────────────────────
         size_t got = sess_->audio_in.pop(frame_buf.data(), FRAME_SAMPLES_24K, 200);
         if (got == 0) {
-            // Timeout: no audio yet. Still check if boot_ready so we can
-            // init standby even without active audio.
-            if (boot_ready_.load() && !switch_queued_.load()) {
-                std::lock_guard<std::mutex> lk(boot_mtx_);
-                if (!pending_boot_payload_.empty()) {
-                    fprintf(stderr, "[orchestrator] boot payload ready while idle, priming standby.\n");
-                    init_standby(pending_boot_payload_);
-                    pending_boot_payload_.clear();
-                    boot_ready_.store(false);
-                }
-            }
+            // Timeout: no audio from client yet.
+            // Boot payload stays cached until silence is detected during
+            // active audio — we never init standby while no audio is flowing
+            // because it would waste GPU and there's nothing to switch from.
             continue;
         }
 
@@ -191,21 +184,34 @@ void Orchestrator::run() {
         }
 
         // ── Check if boot payload arrived ──────────────────────────────────
-        if (boot_ready_.load() && !switch_queued_.load()) {
-            std::lock_guard<std::mutex> lk(boot_mtx_);
-            if (!pending_boot_payload_.empty()) {
-                init_standby(pending_boot_payload_);
-                pending_boot_payload_.clear();
-                boot_ready_.store(false);
-            }
-        }
+        // DO NOT init_standby() here — it blocks for ~5s (system prompts)
+        // and would cause two PP instances to run concurrently on the GPU,
+        // which starves the hot node and garbles audio.
+        //
+        // Instead: store the payload and wait for silence (below).
 
-        // ── Silence detection → execute switch ────────────────────────────
-        if (state_.load() == OrchestratorState::STANDBY_READY) {
+        // ── Silence detection → init standby + switch in one gap ──────────
+        // When boot payload is ready AND output is silent, we know:
+        //   1. The AI has finished its current utterance (silence detected)
+        //   2. The user won't hear audio gaps during the ~5s standby init
+        // So we init standby AND switch in a single silent window.
+        if (boot_ready_.load() && !switch_queued_.load()) {
             bool silent = silence_.push_frame(out.pcm_48k);
             if (silent) {
-                fprintf(stderr, "[orchestrator] silence detected — executing switch.\n");
-                execute_switch();
+                std::lock_guard<std::mutex> lk(boot_mtx_);
+                if (!pending_boot_payload_.empty()) {
+                    fprintf(stderr, "[orchestrator] silence detected with boot payload ready — "
+                                    "init standby + switch.\n");
+                    // Init standby (blocks ~5s but we're in a silence gap)
+                    init_standby(pending_boot_payload_);
+                    pending_boot_payload_.clear();
+                    boot_ready_.store(false);
+
+                    // If standby came up OK, switch immediately
+                    if (state_.load() == OrchestratorState::STANDBY_READY) {
+                        execute_switch();
+                    }
+                }
             }
         } else {
             silence_.reset();
