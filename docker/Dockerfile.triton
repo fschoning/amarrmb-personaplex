@@ -29,6 +29,22 @@ RUN pip install --no-cache-dir -e /app/moshi/
 # CPU DSP resampler (polyphase filtering for 24→48kHz frame smoothing)
 RUN pip install --no-cache-dir soxr
 
+# -----------------------------------------------------------------------
+# vLLM for Mixtral brain (NVFP4 support on Blackwell/GB10)
+# NVIDIA's index provides aarch64 wheels with sm_121 (GB10) support.
+# vLLM also bundles transformers + tokenizer support.
+# -----------------------------------------------------------------------
+RUN pip install --no-cache-dir \
+        vllm \
+        --extra-index-url https://pypi.nvidia.com \
+    || pip install --no-cache-dir vllm  # fallback to PyPI if NVIDIA index fails
+
+# transformers + sentencepiece (needed by mixtral_brain Python backend)
+RUN pip install --no-cache-dir \
+        transformers \
+        sentencepiece \
+        accelerate
+
 # Copy model repository and scripts into image
 COPY model_repository/ /models/
 COPY scripts/ /app/scripts/

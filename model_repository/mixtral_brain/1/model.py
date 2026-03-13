@@ -48,14 +48,28 @@ def _try_vllm(model_dir: str, logger):
         from vllm import LLM, SamplingParams
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(model_dir)
+
+        # Detect NVFP4 quantization from hf_quant_config.json
+        import json, os
+        quant = None
+        quant_cfg_path = os.path.join(model_dir, "hf_quant_config.json")
+        if os.path.exists(quant_cfg_path):
+            with open(quant_cfg_path) as f:
+                cfg = json.load(f)
+            algo = cfg.get("quantization", {}).get("quant_algo", "")
+            if "FP4" in algo.upper() or "NVFP4" in algo.upper():
+                quant = "fp4"
+                logger.log_info(f"mixtral_brain: detected NVFP4 quantization")
+
         llm = LLM(
             model=model_dir,
-            dtype="auto",
-            gpu_memory_utilization=0.35,   # leave room for PersonaPlex (×2)
+            quantization=quant,           # "fp4" for NVFP4, None for standard
+            dtype="bfloat16",             # compute dtype
+            gpu_memory_utilization=0.28,  # leave ~72% for 2× PersonaPlex
             max_model_len=6144,
             trust_remote_code=True,
         )
-        logger.log_info(f"mixtral_brain: loaded via vLLM from {model_dir}")
+        logger.log_info(f"mixtral_brain: loaded via vLLM from {model_dir} (quant={quant})")
         return llm, tokenizer, SamplingParams
     except Exception as e:
         logger.log_info(f"mixtral_brain: vLLM failed ({e}), trying next backend")
