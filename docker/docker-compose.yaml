@@ -73,7 +73,7 @@ services:
   # With MPS: gets 10-20% of GPU SMs (background, latency not critical)
   # -------------------------------------------------------------------------
   brain:
-    image: nvcr.io/nvidia/tritonserver:25.06-py3-tensorrtllm-python-py3
+    image: nvcr.io/nvidia/tritonserver:26.02-trtllm-python-py3
     restart: unless-stopped
     shm_size: '2gb'
     ipc: host                    # required for MPS daemon communication
