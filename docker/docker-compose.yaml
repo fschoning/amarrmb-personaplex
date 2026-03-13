@@ -31,6 +31,7 @@ services:
       LM_TOP_K:          "${LM_TOP_K:-250}"
     volumes:
       - ${HF_CACHE_DIR:-/mnt/models/hf-cache}:/root/.cache/huggingface   # bind-mount existing HF cache
+      - ../tools:/tools:ro                                                  # dev tools (decode_transcript etc.)
     deploy:
       resources:
         reservations:
