@@ -136,11 +136,11 @@ static void session_worker(std::shared_ptr<Session> sess,
             send(make_audio_delta(resp_id, item_id, b64));
         }
 
-        // Text delta — only forward non-zero tokens (convert token id to text if needed)
-        // For now, forward the raw token id; a full implementation would de-tokenise.
-        if (out.text_token > 0 && out.text_token < 32000 /* eos */) {
-            // TODO: decode via sentencepiece — for now send placeholder
-            // send(make_text_delta(resp_id, std::string(1, (char)out.text_token)));
+        // Text token — log raw ID for Phase 0 transcript quality analysis.
+        // Format: "[tok] <session8> <token_id>" — grep for [tok] to extract.
+        if (out.text_token > 0 && out.text_token < 32000 /* vocab size */) {
+            fprintf(stderr, "[tok] %.8s %d\n",
+                    sess->session_id.c_str(), out.text_token);
         }
     }
 
