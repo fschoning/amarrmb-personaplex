@@ -91,7 +91,6 @@ def _try_vllm(model_dir: str, logger):
             gpu_memory_utilization=0.38,    # ~36GB of 96GB total; ~40GB free after 2× PersonaPlex
             max_model_len=1024,             # brain prompts are short; limits KV cache size
             trust_remote_code=True,
-            enforce_eager=True,             # skip CUDA graph capture
             enable_prefix_caching=False,
         )
         logger.log_info(f"mixtral_brain: loaded via vLLM from {model_dir} (quant={quant})")
@@ -175,7 +174,19 @@ class TritonPythonModel:
                 "Install bitsandbytes for transformers fallback."
             )
 
-        self.logger.log_info(f"mixtral_brain: ready (backend={self._backend})")
+        self.logger.log_info(f"brain: ready (backend={self._backend}, model={_MODEL_DIR})")
+
+        # --- Warmup: trigger lazy compilation with a throwaway generate ---
+        if self._backend == "vllm":
+            self.logger.log_info("brain: warming up vLLM (first generate triggers compilation)...")
+            t0 = time.monotonic()
+            try:
+                params = self._vllm_params(temperature=0.7, top_p=0.9, max_tokens=16)
+                self._vllm.generate(["Hello"], params)
+                elapsed = time.monotonic() - t0
+                self.logger.log_info(f"brain: warmup done in {elapsed:.1f}s")
+            except Exception as e:
+                self.logger.log_info(f"brain: warmup failed ({e}), first request will be slow")
 
     def execute(self, requests):
         responses = []
@@ -267,11 +278,17 @@ class TritonPythonModel:
 
     @staticmethod
     def _format_prompt(prompt: str) -> str:
-        """Use chat template format. Falls back to [INST]...[/INST] for Mixtral."""
+        """Wrap in Qwen chat template with /no_think to disable chain-of-thought."""
         prompt = prompt.strip()
-        # Qwen / generic chat format — wrap in user role tags if not already formatted
         if "<|im_start|>" not in prompt and "[INST]" not in prompt:
-            prompt = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+            # System prompt disables reasoning mode for faster, cleaner output
+            prompt = (
+                "<|im_start|>system\n"
+                "You are a concise AI assistant. Respond directly without internal reasoning. /no_think\n"
+                "<|im_end|>\n"
+                f"<|im_start|>user\n{prompt}<|im_end|>\n"
+                "<|im_start|>assistant\n"
+            )
         elif not prompt.startswith("[INST]"):
             prompt = f"[INST] {prompt} [/INST]"
         return prompt
