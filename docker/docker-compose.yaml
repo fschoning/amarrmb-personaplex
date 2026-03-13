@@ -65,7 +65,7 @@ services:
       interval: 15s
       timeout: 10s
       retries: 12
-      start_period: 120s
+      start_period: 240s
 
   # -------------------------------------------------------------------------
   # Brain — SmolLM3-3B NVFP4 via TRT-LLM (FastAPI, separate process for MPS)
