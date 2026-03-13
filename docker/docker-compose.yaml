@@ -68,14 +68,12 @@ services:
       start_period: 120s
 
   # -------------------------------------------------------------------------
-  # Brain Triton — Qwen 3.5 context compiler (separate process for MPS)
-  # With MPS: gets 20% of GPU SMs (background, latency not critical)
+  # Brain Triton — SmolLM3-3B NVFP4 via TRT-LLM (separate process for MPS)
+  # Uses official TRT-LLM Triton image so tensorrt_llm is available.
+  # With MPS: gets 10-20% of GPU SMs (background, latency not critical)
   # -------------------------------------------------------------------------
   brain:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.triton
-    image: personaplex-triton:latest        # same image, different config
+    image: nvcr.io/nvidia/tritonserver:25.06-py3-tensorrtllm-python-py3
     restart: unless-stopped
     shm_size: '2gb'
     ipc: host                    # required for MPS daemon communication
@@ -86,6 +84,7 @@ services:
       - "8011:8011"   # gRPC (different port from triton)
       - "8010:8010"   # HTTP
       - "8012:8012"   # metrics
+    entrypoint: ["/bin/bash", "/scripts/start_triton.sh"]
     environment:
       MODEL_REPO:          "/models"
       BRAIN_ONLY:        "1"         # only load brain model
@@ -97,14 +96,14 @@ services:
       HF_TOKEN:          "${HF_TOKEN:-}"
       HF_HUB_OFFLINE:    "1"
       TRANSFORMERS_OFFLINE: "1"
-      VLLM_ATTENTION_BACKEND: "FLASH_ATTN"
-      VLLM_WORKER_MULTIPROC_METHOD: "spawn"
       # MPS: limit this container to 20% of GPU SMs
       CUDA_MPS_ACTIVE_THREAD_PERCENTAGE: "${BRAIN_GPU_PERCENT:-20}"
     volumes:
       - ${HF_CACHE_DIR:-/mnt/models/hf-cache}:/root/.cache/huggingface
       - ${MODELS_DIR:-/mnt/models}:/mnt/models:ro
       - /tmp/nvidia-mps:/tmp/nvidia-mps    # MPS daemon pipe
+      - ../model_repository:/models:ro     # brain model.py + config
+      - ../scripts:/scripts:ro             # start_triton.sh
     deploy:
       resources:
         reservations:
@@ -117,7 +116,8 @@ services:
       interval: 15s
       timeout: 10s
       retries: 12
-      start_period: 180s   # brain model load is slower
+      start_period: 180s
+   # brain model load is slower
 
   # -------------------------------------------------------------------------
   # C++ Gateway (WebSocket → Triton gRPC)
