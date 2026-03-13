@@ -1,11 +1,12 @@
 """
 brain/1/model.py — Triton Python backend for LLM Brain Reasoner
 
-Runs Qwen 2.5 27B AWQ via vLLM inside the Triton container.
-enforce_eager=True because CUDA graph capture OOMs on the memory-
-constrained GB10 (96GB shared with 2× PersonaPlex).
+SmolLM3-3B via TRT-LLM (NVFP4) or vLLM fallback.
+3B model is ~9× lighter than Qwen 27B — sub-second inference with
+TRT-LLM enables always-on brain with zero GPU contention.
 
-Set BRAIN_MODEL env var to point at any compatible model directory.
+Set BRAIN_ENGINE to the TRT-LLM engine dir (fastest path).
+Set BRAIN_MODEL to the HF weights dir (vLLM/transformers fallback).
 """
 
 import os
@@ -16,106 +17,95 @@ import numpy as np
 import triton_python_backend_utils as pb_utils
 
 # ── Config from environment ──────────────────────────────────────────────────
-_ENGINE_DIR  = os.environ.get("BRAIN_ENGINE", "/mnt/models/brain-engine")
-_MODEL_DIR   = os.environ.get("BRAIN_MODEL",  "/mnt/models/qwen35-27b-awq")
-_HF_MODEL_ID = os.environ.get("BRAIN_HF_ID",  "Qwen/Qwen2.5-27B-Instruct-AWQ")
+_ENGINE_DIR  = os.environ.get("BRAIN_ENGINE", "/mnt/models/smollm3-3b-nvfp4-engine")
+_MODEL_DIR   = os.environ.get("BRAIN_MODEL",  "/mnt/models/smollm3-3b")
+_HF_MODEL_ID = os.environ.get("BRAIN_HF_ID",  "HuggingFaceTB/SmolLM3-3B")
 _DEVICE      = "cuda"
 
 
-def _detect_quantization(model_dir: str, logger) -> str | None:
-    """Detect quantization type. Returns 'awq', 'gptq', 'SKIP_FP4', or None."""
-    for fname in ("hf_quant_config.json", "quantize_config.json"):
-        p = os.path.join(model_dir, fname)
-        if not os.path.exists(p):
-            continue
-        with open(p) as f:
-            cfg = json.load(f)
-        algo = cfg.get("quantization", {}).get("quant_algo", "")
-        if not algo:
-            algo = cfg.get("quant_type", "") or cfg.get("quant_method", "")
-        algo = algo.upper()
-        if "FP4" in algo or "NVFP4" in algo:
-            logger.log_info(
-                "brain: NVFP4 NOT supported on GB10 (sm_121). "
-                "Set BRAIN_MODEL to an AWQ model."
-            )
-            return "SKIP_FP4"
-        if "AWQ" in algo:
-            logger.log_info("brain: detected AWQ quantization")
-            return "awq"
-        if "GPTQ" in algo:
-            logger.log_info("brain: detected GPTQ quantization")
-            return "gptq"
-    return None
-
-
-def _try_trtllm(engine_dir: str, logger):
+# ── TRT-LLM C++ engine loader ────────────────────────────────────────────────
+def _try_trtllm(engine_dir: str, model_dir: str, logger):
+    """Load SmolLM3 via TRT-LLM C++ backend — fastest path."""
     if not os.path.isdir(engine_dir):
         logger.log_info(f"brain: TRT-LLM engine not found at {engine_dir}")
         return None
+
+    # Check engine file exists
+    engine_file = os.path.join(engine_dir, "rank0.engine")
+    if not os.path.isfile(engine_file):
+        logger.log_info(f"brain: no rank0.engine in {engine_dir}")
+        return None
+
+    try:
+        # Use the C++ backend API (avoids PyTorch fallback crashes)
+        from tensorrt_llm._tensorrt_engine import LLM as TrtLLM
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(model_dir)
+        llm = TrtLLM(model=engine_dir)
+        logger.log_info(f"brain: loaded TRT-LLM C++ engine from {engine_dir}")
+        return llm, tokenizer
+    except ImportError:
+        logger.log_info("brain: tensorrt_llm._tensorrt_engine not available, trying ModelRunner...")
+    except Exception as e:
+        logger.log_info(f"brain: TRT-LLM C++ engine failed ({e}), trying ModelRunner...")
+
+    # Fallback: older ModelRunner API
     try:
         import tensorrt_llm
         from tensorrt_llm.runtime import ModelRunner
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(model_dir)
         runner = ModelRunner.from_dir(engine_dir=engine_dir, rank=0)
-        logger.log_info(f"brain: loaded TRT-LLM engine from {engine_dir}")
-        return runner
+        logger.log_info(f"brain: loaded TRT-LLM ModelRunner from {engine_dir}")
+        return runner, tokenizer
     except Exception as e:
-        logger.log_info(f"brain: TRT-LLM failed ({e})")
+        logger.log_info(f"brain: TRT-LLM ModelRunner failed ({e})")
         return None
 
 
+# ── vLLM loader ──────────────────────────────────────────────────────────────
 def _try_vllm(model_dir: str, logger):
-    """Load via vLLM with enforce_eager (CUDA graphs OOM on GB10)."""
+    """Load SmolLM3 via vLLM — 3B model needs minimal VRAM."""
     try:
         from vllm import LLM, SamplingParams
         from transformers import AutoTokenizer
 
-        quant = _detect_quantization(model_dir, logger)
-        if quant == "SKIP_FP4":
-            return None
-
         tokenizer = AutoTokenizer.from_pretrained(model_dir)
         llm = LLM(
             model=model_dir,
-            quantization=quant,
             dtype="bfloat16",
-            gpu_memory_utilization=0.38,
+            gpu_memory_utilization=0.12,    # 3B model needs ~3GB, tiny footprint
             max_model_len=1024,
-            max_num_seqs=1,             # single request at a time
+            max_num_seqs=1,
             trust_remote_code=True,
-            enforce_eager=True,         # CUDA graph capture OOMs on GB10
+            enforce_eager=True,
             enable_prefix_caching=False,
         )
-        logger.log_info(f"brain: loaded via vLLM from {model_dir} (quant={quant})")
+        logger.log_info(f"brain: loaded via vLLM from {model_dir}")
         return llm, tokenizer, SamplingParams
     except Exception as e:
         logger.log_info(f"brain: vLLM failed ({e})")
         return None
 
 
+# ── HF Transformers loader ───────────────────────────────────────────────────
 def _try_transformers(model_dir: str, hf_id: str, logger):
+    """Load SmolLM3 via HF transformers — simplest fallback."""
     try:
         import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-
-        quant = _detect_quantization(model_dir, logger)
-        if quant == "SKIP_FP4":
-            return None
+        from transformers import AutoModelForCausalLM, AutoTokenizer
 
         src = model_dir if os.path.isdir(model_dir) else hf_id
         logger.log_info(f"brain: loading via transformers from {src} ...")
         tokenizer = AutoTokenizer.from_pretrained(src)
-        bnb_cfg = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-        )
         model = AutoModelForCausalLM.from_pretrained(
-            src, quantization_config=bnb_cfg,
+            src, torch_dtype=torch.bfloat16,
             device_map="cuda", trust_remote_code=True,
         )
         model.eval()
-        logger.log_info("brain: loaded via transformers (4-bit BnB)")
+        logger.log_info("brain: loaded via transformers (bf16)")
         return model, tokenizer
     except Exception as e:
         logger.log_info(f"brain: transformers failed ({e})")
@@ -126,18 +116,23 @@ class TritonPythonModel:
 
     def initialize(self, args):
         self.logger = pb_utils.Logger
-        self.logger.log_info(f"brain: initializing from {_MODEL_DIR}...")
+        self.logger.log_info(f"brain: initializing SmolLM3...")
+        self.logger.log_info(f"brain:   engine_dir = {_ENGINE_DIR}")
+        self.logger.log_info(f"brain:   model_dir  = {_MODEL_DIR}")
 
         self._backend     = None
         self._trtllm      = None
+        self._trtllm_tok  = None
         self._vllm        = None
         self._vllm_params = None
         self._hf_model    = None
         self._hf_tok      = None
 
-        runner = _try_trtllm(_ENGINE_DIR, self.logger)
-        if runner is not None:
-            self._trtllm  = runner
+        # Priority: TRT-LLM (fastest) → vLLM → transformers
+        result = _try_trtllm(_ENGINE_DIR, _MODEL_DIR, self.logger)
+        if result is not None:
+            self._trtllm, self._trtllm_tok = result
+            self._hf_tok = self._trtllm_tok   # for chat template
             self._backend = "trtllm"
 
         if self._backend is None:
@@ -154,32 +149,23 @@ class TritonPythonModel:
 
         if self._backend is None:
             raise RuntimeError(
-                f"brain: all backends failed for model '{_MODEL_DIR}'. "
-                "Set BRAIN_MODEL to a compatible model (AWQ recommended)."
+                f"brain: all backends failed. "
+                f"Tried: TRT-LLM ({_ENGINE_DIR}), vLLM ({_MODEL_DIR}), "
+                f"transformers ({_HF_MODEL_ID})."
             )
 
-        self.logger.log_info(f"brain: ready (backend={self._backend}, model={_MODEL_DIR})")
+        self.logger.log_info(f"brain: ready (backend={self._backend})")
 
-        # --- Warmup: must exercise FLA linear attention code paths ---
-        # The first vLLM generate triggers triton kernel JIT for Qwen 3.5's
-        # hybrid attention layers. Use a realistic-length prompt to cover
-        # both standard attention and FLA code paths.
-        if self._backend == "vllm":
-            self.logger.log_info("brain: warming up vLLM (JIT compiling FLA kernels)...")
-            t0 = time.monotonic()
-            try:
-                warmup_prompt = self._format_prompt(
-                    "This is a warmup prompt to trigger kernel compilation. "
-                    "The brain model uses hybrid attention with both standard "
-                    "multi-head attention and flash linear attention layers. "
-                    "Each unique sequence length may trigger JIT compilation "
-                    "of triton kernels for the FLA layers."
-                )
-                params = self._vllm_params(temperature=0.7, top_p=0.9, max_tokens=32)
-                self._vllm.generate([warmup_prompt], params)
-                self.logger.log_info(f"brain: warmup done in {time.monotonic() - t0:.1f}s")
-            except Exception as e:
-                self.logger.log_info(f"brain: warmup failed ({e}), first request will be slow")
+        # Warmup: first inference is always slower (JIT, cache warmup)
+        self.logger.log_info("brain: warming up...")
+        t0 = time.monotonic()
+        try:
+            warmup = self._generate("Say hello.", 8)
+            self.logger.log_info(
+                f"brain: warmup done in {time.monotonic() - t0:.1f}s → '{warmup[:50]}'"
+            )
+        except Exception as e:
+            self.logger.log_info(f"brain: warmup failed ({e}), first request will be slow")
 
     def execute(self, requests):
         responses = []
@@ -207,14 +193,7 @@ class TritonPythonModel:
             f"prompt_len={len(prompt)})"
         )
         t0 = time.monotonic()
-
-        if self._backend == "trtllm":
-            response_text = self._generate_trtllm(prompt, max_tokens)
-        elif self._backend == "vllm":
-            response_text = self._generate_vllm(prompt, max_tokens)
-        else:
-            response_text = self._generate_hf(prompt, max_tokens)
-
+        response_text = self._generate(prompt, max_tokens)
         elapsed = time.monotonic() - t0
         n_words = len(response_text.split())
         self.logger.log_info(
@@ -227,26 +206,57 @@ class TritonPythonModel:
             pb_utils.Tensor("RESPONSE", out_arr),
         ])
 
+    # ── Generate dispatch ────────────────────────────────────────────────────
+    def _generate(self, prompt: str, max_tokens: int) -> str:
+        if self._backend == "trtllm":
+            return self._generate_trtllm(prompt, max_tokens)
+        elif self._backend == "vllm":
+            return self._generate_vllm(prompt, max_tokens)
+        else:
+            return self._generate_hf(prompt, max_tokens)
+
     def _generate_trtllm(self, prompt: str, max_tokens: int) -> str:
+        formatted = self._format_prompt(prompt)
+        t0 = time.monotonic()
+
+        # Try C++ LLM API first (newer tensorrt_llm)
+        if hasattr(self._trtllm, 'generate_async') or hasattr(self._trtllm, 'generate'):
+            try:
+                # C++ LLM.generate() accepts text directly
+                outputs = self._trtllm.generate([formatted], sampling_params=dict(
+                    max_new_tokens=max_tokens, temperature=0.7, top_p=0.9,
+                ))
+                elapsed = time.monotonic() - t0
+                # Handle different output formats
+                if hasattr(outputs[0], 'text'):
+                    raw = outputs[0].text
+                elif hasattr(outputs[0], 'outputs'):
+                    raw = outputs[0].outputs[0].text
+                else:
+                    raw = str(outputs[0])
+
+                self.logger.log_info(f"brain: trtllm generate in {elapsed:.2f}s")
+                return raw.strip()
+            except Exception as e:
+                self.logger.log_info(f"brain: trtllm generate API failed ({e}), trying tokenizer path")
+
+        # Fallback: ModelRunner with manual tokenization
         import torch
-        input_ids = self._trtllm.tokenizer.encode(
-            self._format_prompt(prompt), return_tensors="pt"
-        ).to(_DEVICE)
+        input_ids = self._trtllm_tok.encode(formatted, return_tensors="pt").to(_DEVICE)
         with torch.no_grad():
             output = self._trtllm.generate(
                 batch_input_ids=[input_ids[0]],
                 max_new_tokens=max_tokens,
                 temperature=0.7, top_p=0.9,
             )
-        raw = self._trtllm.tokenizer.decode(
+        elapsed = time.monotonic() - t0
+        raw = self._trtllm_tok.decode(
             output[0][input_ids.shape[1]:], skip_special_tokens=True
         ).strip()
-        return self._strip_thinking(raw)
+        self.logger.log_info(f"brain: trtllm ModelRunner in {elapsed:.2f}s")
+        return raw
 
     def _generate_vllm(self, prompt: str, max_tokens: int) -> str:
-        """Single generate() call. vLLM has ~1s per-call overhead, so chunking
-        is counterproductive (3x slower). Accept ~6s of GPU contention;
-        the orchestrator controls how often the brain fires."""
         params = self._vllm_params(temperature=0.7, top_p=0.9, max_tokens=max_tokens)
         t0 = time.monotonic()
         outputs = self._vllm.generate([self._format_prompt(prompt)], params)
@@ -261,8 +271,7 @@ class TritonPythonModel:
             f"brain: vllm — prompt={n_prompt} toks, output={n_output} toks, "
             f"elapsed={elapsed:.2f}s, decode={decode_tps:.1f} tok/s"
         )
-
-        return self._strip_thinking(out_text)
+        return out_text
 
     def _generate_hf(self, prompt: str, max_tokens: int) -> str:
         import torch
@@ -276,42 +285,37 @@ class TritonPythonModel:
                 pad_token_id=self._hf_tok.eos_token_id,
             )
         raw = self._hf_tok.decode(output_ids[0][input_len:], skip_special_tokens=True).strip()
-        return self._strip_thinking(raw)
+        return raw
 
-    @staticmethod
-    def _strip_thinking(text: str) -> str:
-        """Remove <think>...</think> chain-of-thought blocks (Qwen3 reasoning)."""
-        text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
-        text = re.sub(r'<think>.*$', '', text, flags=re.DOTALL)
-        return text.strip()
-
+    # ── Chat template ────────────────────────────────────────────────────────
     def _format_prompt(self, prompt: str) -> str:
-        """Format prompt using tokenizer's chat template with thinking disabled."""
+        """Format prompt using tokenizer's chat template."""
         prompt = prompt.strip()
-        if "<|im_start|>" in prompt or "[INST]" in prompt:
-            return prompt  # already formatted
+
+        # Already formatted — pass through
+        if "<|im_start|>" in prompt or "[INST]" in prompt or "<|system|>" in prompt:
+            return prompt
 
         messages = [
             {"role": "system", "content": "You are a concise AI assistant. Respond directly."},
             {"role": "user", "content": prompt},
         ]
 
-        # Use tokenizer's native chat template if available (handles thinking mode)
+        # Use tokenizer's native chat template
         if self._hf_tok is not None and hasattr(self._hf_tok, 'apply_chat_template'):
             try:
                 return self._hf_tok.apply_chat_template(
                     messages,
                     tokenize=False,
                     add_generation_prompt=True,
-                    enable_thinking=False,  # Qwen 3.5 native thinking control
                 )
-            except TypeError:
-                pass  # tokenizer doesn't support enable_thinking kwarg
+            except Exception:
+                pass
 
-        # Fallback: manual Qwen chat format
+        # Fallback: generic ChatML format (works for most models)
         return (
             "<|im_start|>system\n"
-            "You are a concise AI assistant. Respond directly. /no_think\n"
+            "You are a concise AI assistant. Respond directly.\n"
             "<|im_end|>\n"
             f"<|im_start|>user\n{prompt}<|im_end|>\n"
             "<|im_start|>assistant\n"
