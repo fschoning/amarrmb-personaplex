@@ -1,12 +1,18 @@
 """
-mixtral_brain/1/model.py — Triton Python backend for Mixtral 8x7B Reasoner
+mixtral_brain/1/model.py — Triton Python backend for LLM Brain Reasoner
 
 Initialization strategy (in order of preference):
   1. TensorRT-LLM engine  — fastest, requires prior trtllm-build step
-  2. vLLM                 — fast, good Blackwell support
-  3. HF Transformers      — slowest fallback, always available
+  2. vLLM                 — fast, Blackwell-compatible (AWQ/GPTQ/standard)
+  3. HF Transformers      — slowest fallback (requires bitsandbytes for 4-bit)
 
-The chosen backend is logged at startup so you can verify which is running.
+Key: NVFP4 models are NOT supported on GB10 (sm_121) due to sm120 cutlass
+kernel incompatibility. Use AWQ or standard models instead.
+Set MIXTRAL_MODEL env var to point at any compatible model directory.
+
+Recommended models (already on /mnt/models):
+  /mnt/models/qwen35-27b-awq   — AWQ 4-bit, 27B params, fast
+  /mnt/models/qwen35-35b-a3b   — MoE 35B/3.5B active, very efficient
 """
 
 import os
@@ -17,10 +23,39 @@ import triton_python_backend_utils as pb_utils
 
 # ── Config from environment ──────────────────────────────────────────────────
 _ENGINE_DIR  = os.environ.get("MIXTRAL_ENGINE", "/mnt/models/mixtral-engine")
-_MODEL_DIR   = os.environ.get("MIXTRAL_MODEL",  "/mnt/models/Mixtral-8x7B-Instruct-v0.1-NVFP4")
-_HF_MODEL_ID = os.environ.get("MIXTRAL_HF_ID",  "mistralai/Mixtral-8x7B-Instruct-v0.1")
+_MODEL_DIR   = os.environ.get("MIXTRAL_MODEL",  "/mnt/models/qwen35-35b-a3b")
+_HF_MODEL_ID = os.environ.get("MIXTRAL_HF_ID",  "Qwen/Qwen2.5-35B-A3B-Instruct")
 _DEVICE      = "cuda"
 _BACKEND     = None   # set during initialize()
+
+
+def _detect_quantization(model_dir: str, logger) -> str | None:
+    """Detect quantization type. Returns 'awq', 'gptq', 'SKIP_FP4', or None."""
+    for fname in ("hf_quant_config.json", "quantize_config.json"):
+        p = os.path.join(model_dir, fname)
+        if not os.path.exists(p):
+            continue
+        with open(p) as f:
+            cfg = json.load(f)
+        # NVFP4 format (nvidia modelopt)
+        algo = cfg.get("quantization", {}).get("quant_algo", "")
+        # AWQ format
+        if not algo:
+            algo = cfg.get("quant_type", "") or cfg.get("quant_method", "")
+        algo = algo.upper()
+        if "FP4" in algo or "NVFP4" in algo:
+            logger.log_info(
+                "mixtral_brain: NVFP4 model detected — NOT supported on GB10 (sm_121). "
+                "Set MIXTRAL_MODEL to an AWQ or standard model."
+            )
+            return "SKIP_FP4"
+        if "AWQ" in algo:
+            logger.log_info(f"mixtral_brain: detected AWQ quantization")
+            return "awq"
+        if "GPTQ" in algo:
+            logger.log_info(f"mixtral_brain: detected GPTQ quantization")
+            return "gptq"
+    return None  # no quantization / standard bf16
 
 
 def _try_trtllm(engine_dir: str, logger):
@@ -31,10 +66,7 @@ def _try_trtllm(engine_dir: str, logger):
     try:
         import tensorrt_llm
         from tensorrt_llm.runtime import ModelRunner
-        runner = ModelRunner.from_dir(
-            engine_dir=engine_dir,
-            rank=0,
-        )
+        runner = ModelRunner.from_dir(engine_dir=engine_dir, rank=0)
         logger.log_info(f"mixtral_brain: loaded TRT-LLM engine from {engine_dir}")
         return runner
     except Exception as e:
@@ -43,31 +75,25 @@ def _try_trtllm(engine_dir: str, logger):
 
 
 def _try_vllm(model_dir: str, logger):
-    """Attempt to load via vLLM. Returns (llm, tokenizer) or None."""
+    """Attempt to load via vLLM. Returns (llm, tokenizer, SamplingParams) or None."""
     try:
         from vllm import LLM, SamplingParams
         from transformers import AutoTokenizer
+
+        quant = _detect_quantization(model_dir, logger)
+        if quant == "SKIP_FP4":
+            return None  # skip FP4 — won't work on sm_121
+
         tokenizer = AutoTokenizer.from_pretrained(model_dir)
-
-        # Detect NVFP4 quantization from hf_quant_config.json
-        import json, os
-        quant = None
-        quant_cfg_path = os.path.join(model_dir, "hf_quant_config.json")
-        if os.path.exists(quant_cfg_path):
-            with open(quant_cfg_path) as f:
-                cfg = json.load(f)
-            algo = cfg.get("quantization", {}).get("quant_algo", "")
-            if "FP4" in algo.upper() or "NVFP4" in algo.upper():
-                quant = "fp4"
-                logger.log_info(f"mixtral_brain: detected NVFP4 quantization")
-
         llm = LLM(
             model=model_dir,
-            quantization=quant,           # "fp4" for NVFP4, None for standard
-            dtype="bfloat16",             # compute dtype
-            gpu_memory_utilization=0.28,  # leave ~72% for 2× PersonaPlex
+            quantization=quant,             # "awq"/"gptq"/None
+            dtype="bfloat16",
+            gpu_memory_utilization=0.28,    # leave ~72% for 2× PersonaPlex
             max_model_len=6144,
             trust_remote_code=True,
+            enforce_eager=True,             # skip CUDA graph capture (more stable)
+            enable_prefix_caching=False,
         )
         logger.log_info(f"mixtral_brain: loaded via vLLM from {model_dir} (quant={quant})")
         return llm, tokenizer, SamplingParams
@@ -82,13 +108,14 @@ def _try_transformers(model_dir: str, hf_id: str, logger):
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-        # Try the NVFP4 directory first, fall back to HF hub ID
+        quant = _detect_quantization(model_dir, logger)
+        if quant == "SKIP_FP4":
+            return None
+
         src = model_dir if os.path.isdir(model_dir) else hf_id
         logger.log_info(f"mixtral_brain: loading via transformers from {src} ...")
-
         tokenizer = AutoTokenizer.from_pretrained(src)
 
-        # Use 4-bit quantization to fit alongside two PersonaPlex instances
         bnb_cfg = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.bfloat16,
@@ -112,7 +139,7 @@ class TritonPythonModel:
 
     def initialize(self, args):
         self.logger = pb_utils.Logger
-        self.logger.log_info("mixtral_brain: initializing...")
+        self.logger.log_info(f"mixtral_brain: initializing from {_MODEL_DIR}...")
 
         self._backend     = None
         self._trtllm      = None
@@ -143,8 +170,10 @@ class TritonPythonModel:
 
         if self._backend is None:
             raise RuntimeError(
-                "mixtral_brain: all backends failed. "
-                "Install tensorrt_llm, vllm, or transformers+bitsandbytes."
+                f"mixtral_brain: all backends failed for model '{_MODEL_DIR}'. "
+                "If using NVFP4 model: switch to AWQ model (set MIXTRAL_MODEL). "
+                "If using AWQ model: ensure vLLM is installed. "
+                "Install bitsandbytes for transformers fallback."
             )
 
         self.logger.log_info(f"mixtral_brain: ready (backend={self._backend})")
@@ -164,18 +193,12 @@ class TritonPythonModel:
         return responses
 
     def _process_one(self, request):
-        # --- Decode inputs ---
-        prompt_tensor = pb_utils.get_input_tensor_by_name(request, "PROMPT")
-        max_tok_tensor = pb_utils.get_input_tensor_by_name(request, "MAX_TOKENS")
+        prompt_tensor   = pb_utils.get_input_tensor_by_name(request, "PROMPT")
+        max_tok_tensor  = pb_utils.get_input_tensor_by_name(request, "MAX_TOKENS")
 
         prompt_bytes = prompt_tensor.as_numpy().flat[0]
-        if isinstance(prompt_bytes, bytes):
-            prompt = prompt_bytes.decode("utf-8")
-        else:
-            prompt = str(prompt_bytes)
-
-        max_tokens = int(max_tok_tensor.as_numpy().flat[0])
-        max_tokens = min(max(max_tokens, 32), 2048)  # clamp
+        prompt = prompt_bytes.decode("utf-8") if isinstance(prompt_bytes, bytes) else str(prompt_bytes)
+        max_tokens = min(max(int(max_tok_tensor.as_numpy().flat[0]), 32), 2048)
 
         self.logger.log_info(
             f"mixtral_brain: generating ({self._backend}, max_tokens={max_tokens}, "
@@ -183,7 +206,6 @@ class TritonPythonModel:
         )
         t0 = time.monotonic()
 
-        # --- Generate ---
         if self._backend == "trtllm":
             response_text = self._generate_trtllm(prompt, max_tokens)
         elif self._backend == "vllm":
@@ -192,12 +214,8 @@ class TritonPythonModel:
             response_text = self._generate_hf(prompt, max_tokens)
 
         elapsed = time.monotonic() - t0
-        self.logger.log_info(
-            f"mixtral_brain: done in {elapsed:.2f}s, "
-            f"{len(response_text.split())} words"
-        )
+        self.logger.log_info(f"mixtral_brain: done in {elapsed:.2f}s, {len(response_text.split())} words")
 
-        # --- Encode output ---
         out_arr = np.array([[response_text.encode("utf-8")]], dtype=object)
         return pb_utils.InferenceResponse(output_tensors=[
             pb_utils.Tensor("RESPONSE", out_arr),
@@ -212,20 +230,14 @@ class TritonPythonModel:
             output = self._trtllm.generate(
                 batch_input_ids=[input_ids[0]],
                 max_new_tokens=max_tokens,
-                temperature=0.7,
-                top_p=0.9,
+                temperature=0.7, top_p=0.9,
             )
-        input_len = input_ids.shape[1]
         return self._trtllm.tokenizer.decode(
-            output[0][input_len:], skip_special_tokens=True
+            output[0][input_ids.shape[1]:], skip_special_tokens=True
         ).strip()
 
     def _generate_vllm(self, prompt: str, max_tokens: int) -> str:
-        params = self._vllm_params(
-            temperature=0.7,
-            top_p=0.9,
-            max_tokens=max_tokens,
-        )
+        params = self._vllm_params(temperature=0.7, top_p=0.9, max_tokens=max_tokens)
         outputs = self._vllm.generate([self._format_prompt(prompt)], params)
         return outputs[0].outputs[0].text.strip()
 
@@ -236,26 +248,25 @@ class TritonPythonModel:
         input_len = inputs["input_ids"].shape[1]
         with torch.no_grad():
             output_ids = self._hf_model.generate(
-                **inputs,
-                max_new_tokens=max_tokens,
-                temperature=0.7,
-                top_p=0.9,
-                do_sample=True,
+                **inputs, max_new_tokens=max_tokens,
+                temperature=0.7, top_p=0.9, do_sample=True,
                 pad_token_id=self._hf_tok.eos_token_id,
             )
-        new_tokens = output_ids[0][input_len:]
-        return self._hf_tok.decode(new_tokens, skip_special_tokens=True).strip()
+        return self._hf_tok.decode(output_ids[0][input_len:], skip_special_tokens=True).strip()
 
     @staticmethod
     def _format_prompt(prompt: str) -> str:
-        """Wrap in Mixtral Instruct format: [INST] ... [/INST]"""
+        """Use chat template format. Falls back to [INST]...[/INST] for Mixtral."""
         prompt = prompt.strip()
-        if not prompt.startswith("[INST]"):
+        # Qwen / generic chat format — wrap in user role tags if not already formatted
+        if "<|im_start|>" not in prompt and "[INST]" not in prompt:
+            prompt = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+        elif not prompt.startswith("[INST]"):
             prompt = f"[INST] {prompt} [/INST]"
         return prompt
 
     def finalize(self):
-        self._trtllm  = None
-        self._vllm    = None
+        self._trtllm   = None
+        self._vllm     = None
         self._hf_model = None
         self.logger.log_info("mixtral_brain: finalized.")

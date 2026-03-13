@@ -31,7 +31,7 @@ services:
       LM_TOP_K:          "${LM_TOP_K:-250}"
       LOAD_MIXTRAL:      "${LOAD_MIXTRAL:-0}"
       MIXTRAL_ENGINE:    "${MIXTRAL_ENGINE:-/mnt/models/mixtral-engine}"
-      MIXTRAL_MODEL:     "${MIXTRAL_MODEL:-/mnt/models/Mixtral-8x7B-Instruct-v0.1-NVFP4}"
+      MIXTRAL_MODEL:     "${MIXTRAL_MODEL:-/mnt/models/qwen35-35b-a3b}"
       HF_HUB_OFFLINE:    "1"        # skip network check, use local cache only
       TRANSFORMERS_OFFLINE: "1"     # same for transformers library
     volumes:
