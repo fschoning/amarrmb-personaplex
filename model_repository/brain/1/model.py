@@ -84,7 +84,7 @@ def _try_vllm(model_dir: str, logger):
             max_num_seqs=1,             # single request at a time
             trust_remote_code=True,
             enforce_eager=True,         # CUDA graph capture OOMs on GB10
-            enable_prefix_caching=True, # reuse KV cache across chunked generate() calls
+            enable_prefix_caching=False,
         )
         logger.log_info(f"brain: loaded via vLLM from {model_dir} (quant={quant})")
         return llm, tokenizer, SamplingParams
@@ -244,60 +244,25 @@ class TritonPythonModel:
         return self._strip_thinking(raw)
 
     def _generate_vllm(self, prompt: str, max_tokens: int) -> str:
-        """Chunked generation: generate `chunk_size` tokens at a time with
-        pauses between chunks.  This yields GPU time so PersonaPlex frames
-        can process with exclusive GPU access (via Triton rate limiter mutex).
+        """Single generate() call. vLLM has ~1s per-call overhead, so chunking
+        is counterproductive (3x slower). Accept ~6s of GPU contention;
+        the orchestrator controls how often the brain fires."""
+        params = self._vllm_params(temperature=0.7, top_p=0.9, max_tokens=max_tokens)
+        t0 = time.monotonic()
+        outputs = self._vllm.generate([self._format_prompt(prompt)], params)
+        elapsed = time.monotonic() - t0
+        result = outputs[0]
 
-        With prefix caching ON, vLLM reuses the KV cache for the prompt
-        prefix — each chunk only prefills the new tokens from the previous
-        chunk, keeping overhead minimal.
-        """
-        chunk_size = 8  # tokens per generate() call
-        pause_s = 0.20  # seconds to yield GPU between chunks
-        formatted = self._format_prompt(prompt)
-        full_output = ""
-        total_output_toks = 0
-        t_start = time.monotonic()
-
-        for chunk_idx in range(0, max_tokens, chunk_size):
-            remaining = min(chunk_size, max_tokens - total_output_toks)
-            if remaining <= 0:
-                break
-
-            params = self._vllm_params(
-                temperature=0.7, top_p=0.9, max_tokens=remaining
-            )
-
-            # Extend prompt with previous output for prefix cache hit
-            current_prompt = formatted + full_output
-            outputs = self._vllm.generate([current_prompt], params)
-            result = outputs[0]
-
-            chunk_text = result.outputs[0].text
-            n_chunk_toks = len(result.outputs[0].token_ids) if result.outputs[0].token_ids else 0
-            total_output_toks += n_chunk_toks
-            full_output += chunk_text
-
-            # Check for natural stop (EOS)
-            if result.outputs[0].finish_reason == "stop":
-                break
-
-            # YIELD GPU: sleep so PP can process frames uncontested.
-            # With gpu_compute mutex, this releases the resource and Triton
-            # schedules pending PP frames with exclusive GPU access.
-            time.sleep(pause_s)
-
-        elapsed = time.monotonic() - t_start
+        out_text = result.outputs[0].text.strip()
         n_prompt = len(result.prompt_token_ids) if result.prompt_token_ids else 0
-        n_chunks = (total_output_toks + chunk_size - 1) // chunk_size
-        decode_tps = total_output_toks / max(elapsed, 0.01)
+        n_output = len(result.outputs[0].token_ids) if result.outputs[0].token_ids else 0
+        decode_tps = n_output / max(elapsed, 0.01)
         self.logger.log_info(
-            f"brain: vllm chunked — {n_chunks} chunks of {chunk_size}, "
-            f"prompt={n_prompt} toks, output={total_output_toks} toks, "
-            f"decode={decode_tps:.1f} tok/s (with {pause_s*1000:.0f}ms pauses)"
+            f"brain: vllm — prompt={n_prompt} toks, output={n_output} toks, "
+            f"elapsed={elapsed:.2f}s, decode={decode_tps:.1f} tok/s"
         )
 
-        return self._strip_thinking(full_output.strip())
+        return self._strip_thinking(out_text)
 
     def _generate_hf(self, prompt: str, max_tokens: int) -> str:
         import torch
