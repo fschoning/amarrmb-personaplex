@@ -28,14 +28,14 @@ except ImportError:
 def query_brain(client, prompt: str, max_tokens: int = 256) -> str:
     """Send a prompt to the mixtral_brain Triton model and return the response."""
 
-    # Build inputs
-    prompt_arr = np.array([[prompt.encode("utf-8")]], dtype=object)
-    max_tok_arr = np.array([[max_tokens]], dtype=np.int32)
+    # Build inputs — dims: [1] means 1-D tensor of length 1
+    prompt_arr  = np.array([prompt.encode("utf-8")], dtype=object)   # shape (1,)
+    max_tok_arr = np.array([max_tokens], dtype=np.int32)              # shape (1,)
 
-    prompt_inp = triton_grpc.InferInput("PROMPT", [1, 1], "BYTES")
+    prompt_inp = triton_grpc.InferInput("PROMPT", [1], "BYTES")
     prompt_inp.set_data_from_numpy(prompt_arr)
 
-    max_tok_inp = triton_grpc.InferInput("MAX_TOKENS", [1, 1], "INT32")
+    max_tok_inp = triton_grpc.InferInput("MAX_TOKENS", [1], "INT32")
     max_tok_inp.set_data_from_numpy(max_tok_arr)
 
     response_out = triton_grpc.InferRequestedOutput("RESPONSE")
