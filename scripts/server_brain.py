@@ -45,7 +45,11 @@ def load_model():
     if os.path.isdir(ENGINE_DIR) and os.path.isfile(os.path.join(ENGINE_DIR, "rank0.engine")):
         try:
             from tensorrt_llm._tensorrt_engine import LLM as TrtLLM
-            engine = TrtLLM(model=ENGINE_DIR, tokenizer=MODEL_DIR)
+            engine = TrtLLM(
+                model=ENGINE_DIR,
+                tokenizer=MODEL_DIR,
+                kv_cache_config={"free_gpu_memory_fraction": 0.05},
+            )
             backend = "trtllm-cpp"
             log.info(f"Loaded TRT-LLM C++ engine from {ENGINE_DIR}")
             return
