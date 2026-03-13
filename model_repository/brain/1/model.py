@@ -76,7 +76,7 @@ def _try_vllm(model_dir: str, logger):
         llm = LLM(
             model=model_dir,
             dtype="bfloat16",
-            gpu_memory_utilization=0.12,    # 3B model needs ~3GB, tiny footprint
+            gpu_memory_utilization=0.30,    # 3B bf16 ≈ 6GB + KV cache
             max_model_len=1024,
             max_num_seqs=1,
             trust_remote_code=True,
@@ -209,11 +209,18 @@ class TritonPythonModel:
     # ── Generate dispatch ────────────────────────────────────────────────────
     def _generate(self, prompt: str, max_tokens: int) -> str:
         if self._backend == "trtllm":
-            return self._generate_trtllm(prompt, max_tokens)
+            return self._strip_thinking(self._generate_trtllm(prompt, max_tokens))
         elif self._backend == "vllm":
-            return self._generate_vllm(prompt, max_tokens)
+            return self._strip_thinking(self._generate_vllm(prompt, max_tokens))
         else:
-            return self._generate_hf(prompt, max_tokens)
+            return self._strip_thinking(self._generate_hf(prompt, max_tokens))
+
+    @staticmethod
+    def _strip_thinking(text: str) -> str:
+        """Remove <think>...</think> chain-of-thought blocks."""
+        text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+        text = re.sub(r'<think>.*$', '', text, flags=re.DOTALL)
+        return text.strip()
 
     def _generate_trtllm(self, prompt: str, max_tokens: int) -> str:
         formatted = self._format_prompt(prompt)
