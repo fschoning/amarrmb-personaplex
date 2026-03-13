@@ -46,9 +46,9 @@ except ImportError:
 
 try:
     import sounddevice as sd
-except ImportError:
+except (ImportError, OSError):
     sd = None
-    print("WARNING: sounddevice not installed — mic/speaker mode unavailable")
+    print("WARNING: sounddevice not available — mic/speaker mode disabled")
 
 
 # ---------------------------------------------------------------------------
