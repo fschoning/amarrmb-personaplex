@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""
+r"""
 Phase 0: Transcript Quality Analysis Tool
 ==========================================
 Decodes raw TEXT_TOKEN IDs logged by the gateway into human-readable text
