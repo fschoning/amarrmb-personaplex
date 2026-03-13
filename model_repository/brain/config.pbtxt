@@ -12,9 +12,9 @@ output [
 ]
 
 # Single instance — brain runs one request at a time
-# Priority 10 = LOWEST. PersonaPlex audio (priority 1) always preempts.
-# Both models compete for the same "gpu_compute" token — Triton schedules
-# the higher-priority model first when contention occurs.
+# Priority 10 = LOWEST. PP (priority 1) is scheduled first.
+# No shared resource — both models use GPU concurrently.
+# Brain may be slower but PP frames are never blocked.
 instance_group [
   {
     count: 1
@@ -22,13 +22,6 @@ instance_group [
     gpus: [0]
     rate_limiter {
       priority: 10
-      resources [
-        {
-          name: "gpu_compute"
-          global: true
-          count: 1
-        }
-      ]
     }
   }
 ]
