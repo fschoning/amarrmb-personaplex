@@ -29,9 +29,9 @@ services:
       PERSONAPLEX_FP8:   "${PERSONAPLEX_FP8:-1}"
       LM_TEMPERATURE:    "${LM_TEMPERATURE:-0.8}"
       LM_TOP_K:          "${LM_TOP_K:-250}"
-      LOAD_MIXTRAL:      "${LOAD_MIXTRAL:-0}"
-      MIXTRAL_ENGINE:    "${MIXTRAL_ENGINE:-/mnt/models/mixtral-engine}"
-      MIXTRAL_MODEL:     "${MIXTRAL_MODEL:-/mnt/models/qwen35-27b-awq}"
+      LOAD_BRAIN:        "${LOAD_BRAIN:-0}"
+      BRAIN_ENGINE:      "${BRAIN_ENGINE:-/mnt/models/brain-engine}"
+      BRAIN_MODEL:       "${BRAIN_MODEL:-/mnt/models/qwen35-27b-awq}"
       HF_HUB_OFFLINE:    "1"        # skip network check, use local cache only
       TRANSFORMERS_OFFLINE: "1"     # same for transformers library
     volumes:

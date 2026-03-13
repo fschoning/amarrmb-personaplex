@@ -1,31 +1,25 @@
 """
-mixtral_brain/1/model.py — Triton Python backend for LLM Brain Reasoner
+brain/1/model.py — Triton Python backend for LLM Brain Reasoner
 
-Initialization strategy (in order of preference):
-  1. TensorRT-LLM engine  — fastest, requires prior trtllm-build step
-  2. vLLM                 — fast, Blackwell-compatible (AWQ/GPTQ/standard)
-  3. HF Transformers      — slowest fallback (requires bitsandbytes for 4-bit)
+Runs Qwen 2.5 27B AWQ via vLLM inside the Triton container.
+enforce_eager=True because CUDA graph capture OOMs on the memory-
+constrained GB10 (96GB shared with 2× PersonaPlex).
 
-Key: NVFP4 models are NOT supported on GB10 (sm_121) due to sm120 cutlass
-kernel incompatibility. Use AWQ or standard models instead.
-Set MIXTRAL_MODEL env var to point at any compatible model directory.
-
-Recommended models (already on /mnt/models):
-  /mnt/models/qwen35-27b-awq   — AWQ 4-bit, ~14GB, works well on GB10
+Set BRAIN_MODEL env var to point at any compatible model directory.
 """
 
 import os
 import time
 import json
+import re
 import numpy as np
 import triton_python_backend_utils as pb_utils
 
 # ── Config from environment ──────────────────────────────────────────────────
-_ENGINE_DIR  = os.environ.get("MIXTRAL_ENGINE", "/mnt/models/mixtral-engine")
-_MODEL_DIR   = os.environ.get("MIXTRAL_MODEL",  "/mnt/models/qwen35-27b-awq")
-_HF_MODEL_ID = os.environ.get("MIXTRAL_HF_ID",  "Qwen/Qwen2.5-27B-Instruct-AWQ")
+_ENGINE_DIR  = os.environ.get("BRAIN_ENGINE", "/mnt/models/brain-engine")
+_MODEL_DIR   = os.environ.get("BRAIN_MODEL",  "/mnt/models/qwen35-27b-awq")
+_HF_MODEL_ID = os.environ.get("BRAIN_HF_ID",  "Qwen/Qwen2.5-27B-Instruct-AWQ")
 _DEVICE      = "cuda"
-_BACKEND     = None   # set during initialize()
 
 
 def _detect_quantization(model_dir: str, logger) -> str | None:
@@ -36,72 +30,70 @@ def _detect_quantization(model_dir: str, logger) -> str | None:
             continue
         with open(p) as f:
             cfg = json.load(f)
-        # NVFP4 format (nvidia modelopt)
         algo = cfg.get("quantization", {}).get("quant_algo", "")
-        # AWQ format
         if not algo:
             algo = cfg.get("quant_type", "") or cfg.get("quant_method", "")
         algo = algo.upper()
         if "FP4" in algo or "NVFP4" in algo:
             logger.log_info(
-                "mixtral_brain: NVFP4 model detected — NOT supported on GB10 (sm_121). "
-                "Set MIXTRAL_MODEL to an AWQ or standard model."
+                "brain: NVFP4 NOT supported on GB10 (sm_121). "
+                "Set BRAIN_MODEL to an AWQ model."
             )
             return "SKIP_FP4"
         if "AWQ" in algo:
-            logger.log_info(f"mixtral_brain: detected AWQ quantization")
+            logger.log_info("brain: detected AWQ quantization")
             return "awq"
         if "GPTQ" in algo:
-            logger.log_info(f"mixtral_brain: detected GPTQ quantization")
+            logger.log_info("brain: detected GPTQ quantization")
             return "gptq"
-    return None  # no quantization / standard bf16
+    return None
 
 
 def _try_trtllm(engine_dir: str, logger):
-    """Attempt to load TRT-LLM engine. Returns runner or None."""
     if not os.path.isdir(engine_dir):
-        logger.log_info(f"mixtral_brain: TRT-LLM engine not found at {engine_dir}")
+        logger.log_info(f"brain: TRT-LLM engine not found at {engine_dir}")
         return None
     try:
         import tensorrt_llm
         from tensorrt_llm.runtime import ModelRunner
         runner = ModelRunner.from_dir(engine_dir=engine_dir, rank=0)
-        logger.log_info(f"mixtral_brain: loaded TRT-LLM engine from {engine_dir}")
+        logger.log_info(f"brain: loaded TRT-LLM engine from {engine_dir}")
         return runner
     except Exception as e:
-        logger.log_info(f"mixtral_brain: TRT-LLM failed ({e}), trying next backend")
+        logger.log_info(f"brain: TRT-LLM failed ({e})")
         return None
 
 
 def _try_vllm(model_dir: str, logger):
-    """Attempt to load via vLLM. Returns (llm, tokenizer, SamplingParams) or None."""
+    """Load via vLLM with enforce_eager (CUDA graphs OOM on GB10)."""
     try:
         from vllm import LLM, SamplingParams
         from transformers import AutoTokenizer
 
         quant = _detect_quantization(model_dir, logger)
         if quant == "SKIP_FP4":
-            return None  # skip FP4 — won't work on sm_121
+            return None
 
         tokenizer = AutoTokenizer.from_pretrained(model_dir)
         llm = LLM(
             model=model_dir,
-            quantization=quant,             # "awq"/"gptq"/None
+            quantization=quant,
             dtype="bfloat16",
-            gpu_memory_utilization=0.38,    # ~36GB of 96GB total; ~40GB free after 2× PersonaPlex
-            max_model_len=1024,             # brain prompts are short; limits KV cache size
+            gpu_memory_utilization=0.38,
+            max_model_len=1024,
+            max_num_seqs=1,             # single request at a time
             trust_remote_code=True,
+            enforce_eager=True,         # CUDA graph capture OOMs on GB10
             enable_prefix_caching=False,
         )
-        logger.log_info(f"mixtral_brain: loaded via vLLM from {model_dir} (quant={quant})")
+        logger.log_info(f"brain: loaded via vLLM from {model_dir} (quant={quant})")
         return llm, tokenizer, SamplingParams
     except Exception as e:
-        logger.log_info(f"mixtral_brain: vLLM failed ({e}), trying next backend")
+        logger.log_info(f"brain: vLLM failed ({e})")
         return None
 
 
 def _try_transformers(model_dir: str, hf_id: str, logger):
-    """Load via HF Transformers (slowest fallback). Returns (model, tokenizer) or None."""
     try:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
@@ -111,25 +103,22 @@ def _try_transformers(model_dir: str, hf_id: str, logger):
             return None
 
         src = model_dir if os.path.isdir(model_dir) else hf_id
-        logger.log_info(f"mixtral_brain: loading via transformers from {src} ...")
+        logger.log_info(f"brain: loading via transformers from {src} ...")
         tokenizer = AutoTokenizer.from_pretrained(src)
-
         bnb_cfg = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_use_double_quant=True,
         )
         model = AutoModelForCausalLM.from_pretrained(
-            src,
-            quantization_config=bnb_cfg,
-            device_map="cuda",
-            trust_remote_code=True,
+            src, quantization_config=bnb_cfg,
+            device_map="cuda", trust_remote_code=True,
         )
         model.eval()
-        logger.log_info("mixtral_brain: loaded via transformers (4-bit BnB)")
+        logger.log_info("brain: loaded via transformers (4-bit BnB)")
         return model, tokenizer
     except Exception as e:
-        logger.log_info(f"mixtral_brain: transformers failed ({e})")
+        logger.log_info(f"brain: transformers failed ({e})")
         return None
 
 
@@ -137,7 +126,7 @@ class TritonPythonModel:
 
     def initialize(self, args):
         self.logger = pb_utils.Logger
-        self.logger.log_info(f"mixtral_brain: initializing from {_MODEL_DIR}...")
+        self.logger.log_info(f"brain: initializing from {_MODEL_DIR}...")
 
         self._backend     = None
         self._trtllm      = None
@@ -146,20 +135,17 @@ class TritonPythonModel:
         self._hf_model    = None
         self._hf_tok      = None
 
-        # --- Try TRT-LLM first ---
         runner = _try_trtllm(_ENGINE_DIR, self.logger)
         if runner is not None:
             self._trtllm  = runner
             self._backend = "trtllm"
 
-        # --- Try vLLM ---
         if self._backend is None:
             result = _try_vllm(_MODEL_DIR, self.logger)
             if result is not None:
                 self._vllm, self._hf_tok, self._vllm_params = result
                 self._backend = "vllm"
 
-        # --- Transformers fallback ---
         if self._backend is None:
             result = _try_transformers(_MODEL_DIR, _HF_MODEL_ID, self.logger)
             if result is not None:
@@ -168,23 +154,20 @@ class TritonPythonModel:
 
         if self._backend is None:
             raise RuntimeError(
-                f"mixtral_brain: all backends failed for model '{_MODEL_DIR}'. "
-                "If using NVFP4 model: switch to AWQ model (set MIXTRAL_MODEL). "
-                "If using AWQ model: ensure vLLM is installed. "
-                "Install bitsandbytes for transformers fallback."
+                f"brain: all backends failed for model '{_MODEL_DIR}'. "
+                "Set BRAIN_MODEL to a compatible model (AWQ recommended)."
             )
 
         self.logger.log_info(f"brain: ready (backend={self._backend}, model={_MODEL_DIR})")
 
-        # --- Warmup: trigger lazy compilation with a throwaway generate ---
+        # --- Warmup ---
         if self._backend == "vllm":
-            self.logger.log_info("brain: warming up vLLM (first generate triggers compilation)...")
+            self.logger.log_info("brain: warming up vLLM...")
             t0 = time.monotonic()
             try:
                 params = self._vllm_params(temperature=0.7, top_p=0.9, max_tokens=16)
                 self._vllm.generate(["Hello"], params)
-                elapsed = time.monotonic() - t0
-                self.logger.log_info(f"brain: warmup done in {elapsed:.1f}s")
+                self.logger.log_info(f"brain: warmup done in {time.monotonic() - t0:.1f}s")
             except Exception as e:
                 self.logger.log_info(f"brain: warmup failed ({e}), first request will be slow")
 
@@ -192,10 +175,9 @@ class TritonPythonModel:
         responses = []
         for request in requests:
             try:
-                resp = self._process_one(request)
-                responses.append(resp)
+                responses.append(self._process_one(request))
             except Exception as e:
-                self.logger.log_error(f"mixtral_brain error: {e}")
+                self.logger.log_error(f"brain error: {e}")
                 import traceback; traceback.print_exc()
                 responses.append(pb_utils.InferenceResponse(
                     error=pb_utils.TritonError(str(e))
@@ -203,15 +185,15 @@ class TritonPythonModel:
         return responses
 
     def _process_one(self, request):
-        prompt_tensor   = pb_utils.get_input_tensor_by_name(request, "PROMPT")
-        max_tok_tensor  = pb_utils.get_input_tensor_by_name(request, "MAX_TOKENS")
+        prompt_tensor  = pb_utils.get_input_tensor_by_name(request, "PROMPT")
+        max_tok_tensor = pb_utils.get_input_tensor_by_name(request, "MAX_TOKENS")
 
         prompt_bytes = prompt_tensor.as_numpy().flat[0]
         prompt = prompt_bytes.decode("utf-8") if isinstance(prompt_bytes, bytes) else str(prompt_bytes)
-        max_tokens = min(max(int(max_tok_tensor.as_numpy().flat[0]), 32), 4096)
+        max_tokens = min(max(int(max_tok_tensor.as_numpy().flat[0]), 32), 1024)
 
         self.logger.log_info(
-            f"mixtral_brain: generating ({self._backend}, max_tokens={max_tokens}, "
+            f"brain: generating ({self._backend}, max_tokens={max_tokens}, "
             f"prompt_len={len(prompt)})"
         )
         t0 = time.monotonic()
@@ -224,7 +206,7 @@ class TritonPythonModel:
             response_text = self._generate_hf(prompt, max_tokens)
 
         elapsed = time.monotonic() - t0
-        self.logger.log_info(f"mixtral_brain: done in {elapsed:.2f}s, {len(response_text.split())} words")
+        self.logger.log_info(f"brain: done in {elapsed:.2f}s, {len(response_text.split())} words")
 
         out_arr = np.array([[response_text.encode("utf-8")]], dtype=object)
         return pb_utils.InferenceResponse(output_tensors=[
@@ -268,11 +250,8 @@ class TritonPythonModel:
 
     @staticmethod
     def _strip_thinking(text: str) -> str:
-        """Remove <think>...</think> chain-of-thought blocks (Qwen3 reasoning mode)."""
-        import re
-        # Remove complete <think>...</think> blocks
+        """Remove <think>...</think> chain-of-thought blocks (Qwen3 reasoning)."""
         text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
-        # If model was cut off mid-think (hit max_tokens inside <think>), strip it
         text = re.sub(r'<think>.*$', '', text, flags=re.DOTALL)
         return text.strip()
 
@@ -281,7 +260,6 @@ class TritonPythonModel:
         """Wrap in Qwen chat template with /no_think to disable chain-of-thought."""
         prompt = prompt.strip()
         if "<|im_start|>" not in prompt and "[INST]" not in prompt:
-            # System prompt disables reasoning mode for faster, cleaner output
             prompt = (
                 "<|im_start|>system\n"
                 "You are a concise AI assistant. Respond directly without internal reasoning. /no_think\n"
@@ -297,4 +275,4 @@ class TritonPythonModel:
         self._trtllm   = None
         self._vllm     = None
         self._hf_model = None
-        self.logger.log_info("mixtral_brain: finalized.")
+        self.logger.log_info("brain: finalized.")

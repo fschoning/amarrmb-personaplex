@@ -1,4 +1,4 @@
-name: "mixtral_brain"
+name: "brain"
 backend: "python"
 max_batch_size: 0
 

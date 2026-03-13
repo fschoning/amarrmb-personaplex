@@ -26,7 +26,7 @@ except ImportError:
 
 
 def query_brain(client, prompt: str, max_tokens: int = 256) -> str:
-    """Send a prompt to the mixtral_brain Triton model and return the response."""
+    """Send a prompt to the brain Triton model and return the response."""
 
     # Build inputs — dims: [1] means 1-D tensor of length 1
     prompt_arr  = np.array([prompt.encode("utf-8")], dtype=object)   # shape (1,)
@@ -42,7 +42,7 @@ def query_brain(client, prompt: str, max_tokens: int = 256) -> str:
 
     t0 = time.monotonic()
     result = client.infer(
-        model_name="mixtral_brain",
+        model_name="brain",
         inputs=[prompt_inp, max_tok_inp],
         outputs=[response_out],
     )
@@ -70,7 +70,7 @@ def main():
     print(f"\n  Mixtral Brain Test")
     print(f"  ──────────────────")
     print(f"  Triton : {args.host}:{args.port}")
-    print(f"  Model  : mixtral_brain")
+    print(f"  Model  : brain")
     print()
 
     client = triton_grpc.InferenceServerClient(
@@ -78,12 +78,12 @@ def main():
     )
 
     # Check model is ready
-    if not client.is_model_ready("mixtral_brain"):
-        print("ERROR: mixtral_brain model is not ready on Triton.")
+    if not client.is_model_ready("brain"):
+        print("ERROR: brain model is not ready on Triton.")
         print("  Check: docker compose logs triton | grep mixtral")
         sys.exit(1)
 
-    print("  ✅ mixtral_brain is ready\n")
+    print("  ✅ brain is ready\n")
 
     if args.interactive:
         print("  Interactive mode — type your prompt and press Enter. Ctrl+C to quit.\n")

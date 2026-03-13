@@ -9,19 +9,19 @@ LOG_VERBOSE="${LOG_VERBOSE:-0}"
 GRPC_PORT="${GRPC_PORT:-8001}"
 HTTP_PORT="${HTTP_PORT:-8000}"
 METRICS_PORT="${METRICS_PORT:-8002}"
-LOAD_MIXTRAL="${LOAD_MIXTRAL:-0}"
+LOAD_BRAIN="${LOAD_BRAIN:-0}"
 
 echo "Starting Triton Inference Server"
 echo "  Model repository : $REPO_DIR"
 echo "  gRPC port        : $GRPC_PORT"
 echo "  HTTP port        : $HTTP_PORT"
 echo "  Metrics port     : $METRICS_PORT"
-echo "  Load Mixtral     : $LOAD_MIXTRAL"
+echo "  Load Brain       : $LOAD_BRAIN"
 
-# Conditionally add mixtral_brain if LOAD_MIXTRAL=1
-MIXTRAL_FLAG=""
-if [ "${LOAD_MIXTRAL}" = "1" ]; then
-    MIXTRAL_FLAG="--load-model=mixtral_brain"
+# Conditionally add brain if LOAD_BRAIN=1
+BRAIN_FLAG=""
+if [ "${LOAD_BRAIN}" = "1" ]; then
+    BRAIN_FLAG="--load-model=brain"
 fi
 
 exec tritonserver \
@@ -32,7 +32,7 @@ exec tritonserver \
     --log-verbose="${LOG_VERBOSE}" \
     --model-control-mode=explicit \
     --load-model=personaplex_pipeline \
-    ${MIXTRAL_FLAG} \
+    ${BRAIN_FLAG} \
     --strict-readiness=true \
     --exit-on-error=false \
     --backend-config=python,shm-default-byte-size=134217728 \
