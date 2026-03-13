@@ -32,8 +32,10 @@ services:
       LOAD_BRAIN:        "${LOAD_BRAIN:-0}"
       BRAIN_ENGINE:      "${BRAIN_ENGINE:-/mnt/models/brain-engine}"
       BRAIN_MODEL:       "${BRAIN_MODEL:-/mnt/models/qwen35-27b-awq}"
-      HF_HUB_OFFLINE:    "1"        # skip network check, use local cache only
-      TRANSFORMERS_OFFLINE: "1"     # same for transformers library
+      HF_HUB_OFFLINE:    "1"
+      TRANSFORMERS_OFFLINE: "1"
+      VLLM_ATTENTION_BACKEND: "FLASH_ATTN"     # prevent FLA (Flash Linear Attention) fallback
+      VLLM_WORKER_MULTIPROC_METHOD: "spawn"    # compatible with Triton Python backend
     volumes:
       - ${HF_CACHE_DIR:-/mnt/models/hf-cache}:/root/.cache/huggingface
       - ${MODELS_DIR:-/mnt/models}:/mnt/models:ro          # Mixtral engine + weights
