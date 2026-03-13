@@ -72,7 +72,7 @@ def parse_token_line(line: str) -> tuple[str, int] | None:
     Parse a [tok] log line.
     Format: "[tok] <session8> <token_id>"
     """
-    m = re.match(r'\[tok\]\s+(\S+)\s+(\d+)', line)
+    m = re.search(r'\[tok\]\s+(\S+)\s+(\d+)', line)
     if m:
         return m.group(1), int(m.group(2))
     return None
