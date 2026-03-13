@@ -107,7 +107,7 @@ Orchestrator::Orchestrator(const Config& cfg,
 
     // Try to connect to brain
     try {
-        brain_ = std::make_unique<BrainClient>(cfg_.triton_url, "brain");
+        brain_ = std::make_unique<BrainClient>(cfg_.brain_grpc_url, "brain");
         brain_available_ = brain_->is_ready();
         if (brain_available_)
             fprintf(stderr, "[orchestrator] Brain LLM available.\n");

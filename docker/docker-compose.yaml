@@ -1,11 +1,20 @@
 # docker/docker-compose.yaml — PersonaPlex v2 full stack
+#
+# MPS MODE (zero choppiness):
+#   1. Start MPS daemon:  sudo bash scripts/start_mps.sh
+#   2. Start stack:       docker compose up -d
+#   3. Stop:              docker compose down && sudo bash scripts/stop_mps.sh
+#
+# SINGLE-CONTAINER MODE (legacy, brain+PP on same GPU, choppy during brain):
+#   LOAD_BRAIN=1 USE_MPS=0 docker compose up -d
 
 name: personaplex-v2
 
 services:
 
   # -------------------------------------------------------------------------
-  # Triton Inference Server
+  # Triton Inference Server — PersonaPlex pipeline only
+  # With MPS: gets 80% of GPU SMs (real-time audio, latency-critical)
   # -------------------------------------------------------------------------
   triton:
     build:
@@ -14,6 +23,7 @@ services:
     image: personaplex-triton:latest
     restart: unless-stopped
     shm_size: '4gb'
+    ipc: host                    # required for MPS daemon communication
     dns:
       - 8.8.8.8
       - 8.8.4.4
@@ -29,17 +39,20 @@ services:
       PERSONAPLEX_FP8:   "${PERSONAPLEX_FP8:-1}"
       LM_TEMPERATURE:    "${LM_TEMPERATURE:-0.8}"
       LM_TOP_K:          "${LM_TOP_K:-250}"
-      LOAD_BRAIN:        "${LOAD_BRAIN:-0}"
+      LOAD_BRAIN:        "0"         # brain is in separate container
       BRAIN_ENGINE:      "${BRAIN_ENGINE:-/mnt/models/brain-engine}"
       BRAIN_MODEL:       "${BRAIN_MODEL:-/mnt/models/qwen35-27b-awq}"
       HF_HUB_OFFLINE:    "1"
       TRANSFORMERS_OFFLINE: "1"
-      VLLM_ATTENTION_BACKEND: "FLASH_ATTN"     # prevent FLA (Flash Linear Attention) fallback
-      VLLM_WORKER_MULTIPROC_METHOD: "spawn"    # compatible with Triton Python backend
+      VLLM_ATTENTION_BACKEND: "FLASH_ATTN"
+      VLLM_WORKER_MULTIPROC_METHOD: "spawn"
+      # MPS: limit this container to 80% of GPU SMs
+      CUDA_MPS_ACTIVE_THREAD_PERCENTAGE: "${PP_GPU_PERCENT:-80}"
     volumes:
       - ${HF_CACHE_DIR:-/mnt/models/hf-cache}:/root/.cache/huggingface
-      - ${MODELS_DIR:-/mnt/models}:/mnt/models:ro          # Mixtral engine + weights
-      - ../tools:/tools:ro                                   # dev tools
+      - ${MODELS_DIR:-/mnt/models}:/mnt/models:ro
+      - ../tools:/tools:ro
+      - /tmp/nvidia-mps:/tmp/nvidia-mps    # MPS daemon pipe
     deploy:
       resources:
         reservations:
@@ -52,7 +65,59 @@ services:
       interval: 15s
       timeout: 10s
       retries: 12
-      start_period: 120s   # weight load can take a few minutes
+      start_period: 120s
+
+  # -------------------------------------------------------------------------
+  # Brain Triton — Qwen 3.5 context compiler (separate process for MPS)
+  # With MPS: gets 20% of GPU SMs (background, latency not critical)
+  # -------------------------------------------------------------------------
+  brain:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.triton
+    image: personaplex-triton:latest        # same image, different config
+    restart: unless-stopped
+    shm_size: '2gb'
+    ipc: host                    # required for MPS daemon communication
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    ports:
+      - "8011:8011"   # gRPC (different port from triton)
+      - "8010:8010"   # HTTP
+      - "8012:8012"   # metrics
+    environment:
+      MODEL_REPO:          "/models"
+      BRAIN_ONLY:        "1"         # only load brain model
+      GRPC_PORT:         "8011"
+      HTTP_PORT:         "8010"
+      METRICS_PORT:      "8012"
+      BRAIN_ENGINE:      "${BRAIN_ENGINE:-/mnt/models/brain-engine}"
+      BRAIN_MODEL:       "${BRAIN_MODEL:-/mnt/models/qwen35-27b-awq}"
+      HF_TOKEN:          "${HF_TOKEN:-}"
+      HF_HUB_OFFLINE:    "1"
+      TRANSFORMERS_OFFLINE: "1"
+      VLLM_ATTENTION_BACKEND: "FLASH_ATTN"
+      VLLM_WORKER_MULTIPROC_METHOD: "spawn"
+      # MPS: limit this container to 20% of GPU SMs
+      CUDA_MPS_ACTIVE_THREAD_PERCENTAGE: "${BRAIN_GPU_PERCENT:-20}"
+    volumes:
+      - ${HF_CACHE_DIR:-/mnt/models/hf-cache}:/root/.cache/huggingface
+      - ${MODELS_DIR:-/mnt/models}:/mnt/models:ro
+      - /tmp/nvidia-mps:/tmp/nvidia-mps    # MPS daemon pipe
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8010/v2/health/live"]
+      interval: 15s
+      timeout: 10s
+      retries: 12
+      start_period: 180s   # brain model load is slower
 
   # -------------------------------------------------------------------------
   # C++ Gateway (WebSocket → Triton gRPC)
@@ -67,8 +132,11 @@ services:
     depends_on:
       triton:
         condition: service_healthy
+      brain:
+        condition: service_healthy
     environment:
-      TRITON_GRPC_URL:    "localhost:8001"
+      TRITON_GRPC_URL:    "localhost:8001"      # PP pipeline
+      BRAIN_GRPC_URL:     "localhost:8011"      # Brain (separate container)
       MAX_SESSIONS:       "${MAX_SESSIONS:-6}"
       SESSION_TIMEOUT_S:  "${SESSION_TIMEOUT_S:-300}"
       WS_PORT:            "${WS_PORT:-8998}"

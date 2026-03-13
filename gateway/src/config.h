@@ -30,8 +30,12 @@ struct Config {
     std::string ssl_cert       = "";          // empty = no TLS
     std::string ssl_key        = "";
 
-    // Triton gRPC endpoint (localhost on same machine)
+    // Triton gRPC endpoint for PersonaPlex pipeline
     std::string triton_url     = "localhost:8001";
+
+    // Brain gRPC endpoint (separate Triton instance for MPS isolation)
+    // Defaults to triton_url if not set (backward-compatible single-container mode)
+    std::string brain_grpc_url = "";
 
     // Concurrency cap — must match instance_group.count in Triton configs
     int         max_sessions   = 6;
@@ -62,6 +66,7 @@ struct Config {
         c.ssl_cert       = get("SSL_CERT",        "");
         c.ssl_key        = get("SSL_KEY",         "");
         c.triton_url     = get("TRITON_GRPC_URL", c.triton_url.c_str());
+        c.brain_grpc_url = get("BRAIN_GRPC_URL",  c.triton_url.c_str());  // fallback to triton_url
         c.max_sessions   = geti("MAX_SESSIONS",   c.max_sessions);
         c.session_timeout_s = geti("SESSION_TIMEOUT_S", c.session_timeout_s);
         c.pipeline_model = get("PIPELINE_MODEL",  c.pipeline_model.c_str());

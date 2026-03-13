@@ -40,12 +40,7 @@ instance_group [
     count: 2
     kind: KIND_GPU
     gpus: [0]
-    rate_limiter {
-      # Priority 1 = highest.  PP is scheduled before brain.
-      # No resource mutex: brain chunked generation (8 tok/call + 200ms
-      # sleep) creates natural GPU idle windows.  During sleep, brain
-      # launches zero CUDA kernels -> PP gets full GPU bandwidth.
-      priority: 1
-    }
+    # GPU isolation handled by CUDA MPS (hardware SM partitioning).
+    # No Triton rate_limiter needed — each container gets dedicated SMs.
   }
 ]
