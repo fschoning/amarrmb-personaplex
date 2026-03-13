@@ -183,39 +183,19 @@ void Orchestrator::run() {
             frames_since_trigger_ = 0;
         }
 
-        // ── Check if boot payload arrived ──────────────────────────────────
-        // DO NOT init_standby() here — it blocks for ~5s (system prompts)
-        // and would cause two PP instances to run concurrently on the GPU,
-        // which starves the hot node and garbles audio.
+        // ── Brain pre-computation ──────────────────────────────────────────
+        // The brain fires periodically and caches a boot payload for future
+        // use.  We do NOT auto-switch nodes.  Switching is only triggered by:
+        //   - Phase 4: keyword detection ("switch", "new topic")
+        //   - Phase 4: client-sent switch event
+        //   - Phase 4: brain detecting a topic change in the transcript
         //
-        // Instead: store the payload and wait for silence (below).
-
-        // ── Silence detection → init standby + switch in one gap ──────────
-        // When boot payload is ready AND output is silent, we know:
-        //   1. The AI has finished its current utterance (silence detected)
-        //   2. The user won't hear audio gaps during the ~5s standby init
-        // So we init standby AND switch in a single silent window.
-        if (boot_ready_.load() && !switch_queued_.load()) {
-            bool silent = silence_.push_frame(out.pcm_48k);
-            if (silent) {
-                std::lock_guard<std::mutex> lk(boot_mtx_);
-                if (!pending_boot_payload_.empty()) {
-                    fprintf(stderr, "[orchestrator] silence detected with boot payload ready — "
-                                    "init standby + switch.\n");
-                    // Init standby (blocks ~5s but we're in a silence gap)
-                    init_standby(pending_boot_payload_);
-                    pending_boot_payload_.clear();
-                    boot_ready_.store(false);
-
-                    // If standby came up OK, switch immediately
-                    if (state_.load() == OrchestratorState::STANDBY_READY) {
-                        execute_switch();
-                    }
-                }
-            }
-        } else {
-            silence_.reset();
-        }
+        // For now the cached payload just stays ready.  This validates that
+        // brain + PP coexist without latency impact (rate limiter proof).
+        //
+        // The silence_detector still runs so that when switch IS triggered,
+        // it happens at a natural pause.
+        silence_.push_frame(out.pcm_48k);
     }
 
     // ── Clean shutdown ────────────────────────────────────────────────────
@@ -301,26 +281,25 @@ void Orchestrator::init_standby(const std::string& boot_payload) {
     ts_standby_ = std::make_unique<TritonSession>(
         cfg_.triton_url, cfg_.pipeline_model, corrid_standby_, cfg_.model_version);
 
-    // Reuse the same voice as the hot node
+    // Reuse the SAME voice as the hot node (from session config)
     std::vector<uint8_t> voice_bytes;
     if (!sess_->config.voice_prompt_embedding.empty()) {
         const auto& emb = sess_->config.voice_prompt_embedding;
         voice_bytes = base64_decode(emb.data(), emb.size());
     }
 
-    // Boot payload → TEXT_PROMPT_TOKENS (send as raw string — pipeline will
-    // tokenise internally when it receives VOICE_PROMPT_BYTES).
-    // For now: encode the boot_payload string as a utf-8 byte sequence and
-    // store in voice_bytes (repurposed until we have a dedicated input).
-    //
-    // TODO(phase4): add a BOOT_PAYLOAD input to the Triton pipeline model so
-    // the pipeline can tokenise it natively, rather than reusing voice_bytes.
-    std::vector<uint8_t> boot_bytes(boot_payload.begin(), boot_payload.end());
+    // Carry over voice name tokens (e.g. [-999, 78, 65, 84, 70, 48] = "NATF0")
+    std::vector<int32_t> text_tokens = sess_->config.text_prompt_tokens;
 
-    // text_tokens: send empty for now — the boot_payload is in voice_bytes
-    std::vector<int32_t> no_tokens;
+    fprintf(stderr, "[orchestrator] standby using voice_bytes=%zu text_tokens=%zu\n",
+            voice_bytes.size(), text_tokens.size());
 
-    bool ok = ts_standby_->send_start(boot_bytes, no_tokens);
+    // TODO(phase4): inject boot_payload as text context into the pipeline
+    // For now: boot_payload is logged but not delivered to the LM.
+    fprintf(stderr, "[orchestrator] boot_payload (%zu bytes): %.100s...\n",
+            boot_payload.size(), boot_payload.c_str());
+
+    bool ok = ts_standby_->send_start(voice_bytes, text_tokens);
     if (!ok) {
         fprintf(stderr, "[orchestrator] standby send_start failed — aborting switch.\n");
         ts_standby_.reset();
