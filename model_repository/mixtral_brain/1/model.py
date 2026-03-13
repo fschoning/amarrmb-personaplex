@@ -197,7 +197,7 @@ class TritonPythonModel:
 
         prompt_bytes = prompt_tensor.as_numpy().flat[0]
         prompt = prompt_bytes.decode("utf-8") if isinstance(prompt_bytes, bytes) else str(prompt_bytes)
-        max_tokens = min(max(int(max_tok_tensor.as_numpy().flat[0]), 32), 2048)
+        max_tokens = min(max(int(max_tok_tensor.as_numpy().flat[0]), 32), 4096)
 
         self.logger.log_info(
             f"mixtral_brain: generating ({self._backend}, max_tokens={max_tokens}, "
@@ -231,14 +231,15 @@ class TritonPythonModel:
                 max_new_tokens=max_tokens,
                 temperature=0.7, top_p=0.9,
             )
-        return self._trtllm.tokenizer.decode(
+        raw = self._trtllm.tokenizer.decode(
             output[0][input_ids.shape[1]:], skip_special_tokens=True
         ).strip()
+        return self._strip_thinking(raw)
 
     def _generate_vllm(self, prompt: str, max_tokens: int) -> str:
         params = self._vllm_params(temperature=0.7, top_p=0.9, max_tokens=max_tokens)
         outputs = self._vllm.generate([self._format_prompt(prompt)], params)
-        return outputs[0].outputs[0].text.strip()
+        return self._strip_thinking(outputs[0].outputs[0].text.strip())
 
     def _generate_hf(self, prompt: str, max_tokens: int) -> str:
         import torch
@@ -251,7 +252,18 @@ class TritonPythonModel:
                 temperature=0.7, top_p=0.9, do_sample=True,
                 pad_token_id=self._hf_tok.eos_token_id,
             )
-        return self._hf_tok.decode(output_ids[0][input_len:], skip_special_tokens=True).strip()
+        raw = self._hf_tok.decode(output_ids[0][input_len:], skip_special_tokens=True).strip()
+        return self._strip_thinking(raw)
+
+    @staticmethod
+    def _strip_thinking(text: str) -> str:
+        """Remove <think>...</think> chain-of-thought blocks (Qwen3 reasoning mode)."""
+        import re
+        # Remove complete <think>...</think> blocks
+        text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+        # If model was cut off mid-think (hit max_tokens inside <think>), strip it
+        text = re.sub(r'<think>.*$', '', text, flags=re.DOTALL)
+        return text.strip()
 
     @staticmethod
     def _format_prompt(prompt: str) -> str:

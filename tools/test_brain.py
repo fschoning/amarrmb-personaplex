@@ -115,7 +115,7 @@ def main():
         ]
         for p in prompts:
             print(f"  Prompt: {p}")
-            response, elapsed = query_brain(client, p, max_tokens=128)
+            response, elapsed = query_brain(client, p, max_tokens=512)
             print(f"  Response: {response}")
             print(f"  Time: {elapsed:.2f}s\n")
 
