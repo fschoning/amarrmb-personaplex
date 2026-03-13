@@ -54,7 +54,7 @@ struct Session {
     std::string        session_id;   // UUID string sent to client
 
     // Config populated from session.update
-    proto::SessionConfig config;
+    SessionConfig       config;
     std::atomic<bool>    config_set{false};
 
     // Audio buffer: gateway writes, session thread reads

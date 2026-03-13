@@ -17,6 +17,9 @@
 
 namespace pg {
 
+using namespace pg::audio;
+using namespace pg::proto;
+
 // ============================================================================
 // SilenceDetector
 // ============================================================================
@@ -93,9 +96,9 @@ Orchestrator::Orchestrator(const Config& cfg,
     : cfg_(cfg)
     , sess_(sess)
     , send_(send)
-    , silence_(cfg.silence_threshold, cfg.silence_hold_frames)
     , corrid_hot_(sess->corrid)
-    , corrid_standby_(sess->corrid + 1000)   // offset to avoid CORRID collision
+    , corrid_standby_(sess->corrid + 1000)
+    , silence_(cfg.silence_threshold, cfg.silence_hold_frames)
 {
     // Persona from session config
     persona_ = sess_->config.persona_prompt.empty()
@@ -221,8 +224,10 @@ void Orchestrator::run() {
 // ---------------------------------------------------------------------------
 void Orchestrator::init_hot() {
     std::vector<uint8_t> voice_bytes;
-    if (!sess_->config.voice_prompt_embedding.empty())
-        voice_bytes = base64_decode(sess_->config.voice_prompt_embedding);
+    if (!sess_->config.voice_prompt_embedding.empty()) {
+        const auto& emb = sess_->config.voice_prompt_embedding;
+        voice_bytes = base64_decode(emb.data(), emb.size());
+    }
 
     std::vector<int32_t> text_tokens = sess_->config.text_prompt_tokens;
 
@@ -292,8 +297,10 @@ void Orchestrator::init_standby(const std::string& boot_payload) {
 
     // Reuse the same voice as the hot node
     std::vector<uint8_t> voice_bytes;
-    if (!sess_->config.voice_prompt_embedding.empty())
-        voice_bytes = base64_decode(sess_->config.voice_prompt_embedding);
+    if (!sess_->config.voice_prompt_embedding.empty()) {
+        const auto& emb = sess_->config.voice_prompt_embedding;
+        voice_bytes = base64_decode(emb.data(), emb.size());
+    }
 
     // Boot payload → TEXT_PROMPT_TOKENS (send as raw string — pipeline will
     // tokenise internally when it receives VOICE_PROMPT_BYTES).
