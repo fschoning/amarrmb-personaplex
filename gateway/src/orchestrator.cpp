@@ -137,13 +137,7 @@ void Orchestrator::run() {
     while (!sess_->should_close.load()) {
         // ── Pop 80ms of PCM from ring buffer ──────────────────────────────
         size_t got = sess_->audio_in.pop(frame_buf.data(), FRAME_SAMPLES_24K, 200);
-        if (got == 0) {
-            // Timeout: no audio from client yet.
-            // Boot payload stays cached until silence is detected during
-            // active audio — we never init standby while no audio is flowing
-            // because it would waste GPU and there's nothing to switch from.
-            continue;
-        }
+        if (got == 0) continue;
 
         // ── Send frame to hot node ─────────────────────────────────────────
         FrameOutput out;
@@ -170,32 +164,48 @@ void Orchestrator::run() {
         ++frame_no_;
         ++frames_since_trigger_;
 
-        // ── Decide whether to trigger brain (every 125 frames = ~10s) ─────
+        // ── Brain always-on ────────────────────────────────────────────────
+        // With MPS, brain has dedicated GPU SMs — keep them busy.
+        // Fire brain immediately on first tokens, and re-fire as soon as
+        // the previous query completes.  Boot payload stays always-fresh.
         if (brain_available_
             && !brain_in_flight_.load()
-            && !switch_queued_.load()
-            && state_.load() == OrchestratorState::HOT_ONLY
-            && should_trigger_brain())
+            && transcript_.size() >= 10)    // wait for minimal context
         {
-            std::string transcript_snapshot = transcript_.as_text();
-            std::string prompt              = build_brain_prompt(persona_);
+            std::string prompt = build_brain_prompt(persona_);
             request_brain_async(prompt);
-            frames_since_trigger_ = 0;
         }
 
-        // ── Brain pre-computation ──────────────────────────────────────────
-        // The brain fires periodically and caches a boot payload for future
-        // use.  We do NOT auto-switch nodes.  Switching is only triggered by:
-        //   - Phase 4: keyword detection ("switch", "new topic")
-        //   - Phase 4: client-sent switch event
-        //   - Phase 4: brain detecting a topic change in the transcript
-        //
-        // For now the cached payload just stays ready.  This validates that
-        // brain + PP coexist without latency impact (rate limiter proof).
-        //
-        // The silence_detector still runs so that when switch IS triggered,
-        // it happens at a natural pause.
-        silence_.push_frame(out.pcm_48k);
+        // ── Switch every 30s ───────────────────────────────────────────────
+        // At the 375-frame mark, if a boot payload is ready, wait for
+        // silence then init standby + switch.  With MPS, the standby init
+        // (~5s system prompts) runs on the same PP partition but brain is
+        // on its own partition and won't cause contention.
+        constexpr int kSwitchEveryFrames = 375;  // 375 × 80ms = 30s
+
+        if (frames_since_trigger_ >= kSwitchEveryFrames
+            && boot_ready_.load()
+            && !switch_queued_.load())
+        {
+            bool silent = silence_.push_frame(out.pcm_48k);
+            if (silent) {
+                std::lock_guard<std::mutex> lk(boot_mtx_);
+                if (!pending_boot_payload_.empty()) {
+                    fprintf(stderr, "[orchestrator] 30s switch: silence detected, "
+                                    "init standby + switch (frame %d).\n", frame_no_);
+                    init_standby(pending_boot_payload_);
+                    pending_boot_payload_.clear();
+                    boot_ready_.store(false);
+
+                    if (state_.load() == OrchestratorState::STANDBY_READY) {
+                        execute_switch();
+                    }
+                }
+            }
+        } else {
+            // Keep silence detector running even when not switching
+            silence_.push_frame(out.pcm_48k);
+        }
     }
 
     // ── Clean shutdown ────────────────────────────────────────────────────
@@ -246,7 +256,7 @@ void Orchestrator::request_brain_async(const std::string& prompt) {
     brain_thread_ = std::thread([this, prompt]() {
         fprintf(stderr, "[brain] querying (prompt_len=%zu)...\n", prompt.size());
         auto t0   = std::chrono::steady_clock::now();
-        std::string response = brain_->query(prompt, 64);  // 64 tokens ≈ 6s, minimize GPU contention
+        std::string response = brain_->query(prompt, 64);
         auto ms   = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - t0).count();
         fprintf(stderr, "[brain] response in %ldms: %.80s...\n", ms, response.c_str());
@@ -259,9 +269,11 @@ void Orchestrator::request_brain_async(const std::string& prompt) {
             }
             boot_ready_.store(true);
         } else {
-            fprintf(stderr, "[brain] empty response — aborting switch.\n");
-            state_.store(OrchestratorState::HOT_ONLY);
+            fprintf(stderr, "[brain] empty response.\n");
         }
+
+        // Always return to HOT_ONLY so brain can fire again immediately
+        state_.store(OrchestratorState::HOT_ONLY);
         brain_in_flight_.store(false);
     });
 }
