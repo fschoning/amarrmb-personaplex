@@ -107,9 +107,11 @@ def generate(prompt: str, max_tokens: int = 64) -> str:
     formatted = format_prompt(prompt)
 
     if backend == "trtllm-cpp":
-        outputs = engine.generate([formatted], sampling_params=dict(
-            max_new_tokens=max_tokens, temperature=0.7, top_p=0.9,
-        ))
+        from tensorrt_llm import SamplingParams as TrtSamplingParams
+        params = TrtSamplingParams(
+            max_tokens=max_tokens, temperature=0.7, top_p=0.9,
+        )
+        outputs = engine.generate([formatted], sampling_params=params)
         if hasattr(outputs[0], 'text'):
             raw = outputs[0].text
         elif hasattr(outputs[0], 'outputs'):
