@@ -1,0 +1,38 @@
+name: "mixtral_brain"
+backend: "python"
+max_batch_size: 0
+
+input [
+  { name: "PROMPT"     data_type: TYPE_STRING  dims: [1] },
+  { name: "MAX_TOKENS" data_type: TYPE_INT32   dims: [1] }
+]
+
+output [
+  { name: "RESPONSE"   data_type: TYPE_STRING  dims: [1] }
+]
+
+# Single instance — Mixtral runs one request at a time
+# Lower priority than personaplex_pipeline (real-time audio)
+instance_group [
+  {
+    count: 1
+    kind: KIND_GPU
+    gpus: [0]
+  }
+]
+
+# Allow up to 60 seconds for Mixtral to generate a response
+model_warm_up [
+  {
+    name: "warmup"
+    batch_size: 1
+    inputs {
+      key: "PROMPT"
+      value { data_type: TYPE_STRING  dims: [1]  string_contents: ["Hello"] }
+    }
+    inputs {
+      key: "MAX_TOKENS"
+      value { data_type: TYPE_INT32   dims: [1]  int32_contents: [32] }
+    }
+  }
+]

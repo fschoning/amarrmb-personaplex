@@ -29,9 +29,13 @@ services:
       PERSONAPLEX_FP8:   "${PERSONAPLEX_FP8:-1}"
       LM_TEMPERATURE:    "${LM_TEMPERATURE:-0.8}"
       LM_TOP_K:          "${LM_TOP_K:-250}"
+      LOAD_MIXTRAL:      "${LOAD_MIXTRAL:-0}"          # set to 1 to enable brain
+      MIXTRAL_ENGINE:    "${MIXTRAL_ENGINE:-/mnt/models/mixtral-engine}"
+      MIXTRAL_MODEL:     "${MIXTRAL_MODEL:-/mnt/models/Mixtral-8x7B-Instruct-v0.1-NVFP4}"
     volumes:
-      - ${HF_CACHE_DIR:-/mnt/models/hf-cache}:/root/.cache/huggingface   # bind-mount existing HF cache
-      - ../tools:/tools:ro                                                  # dev tools (decode_transcript etc.)
+      - ${HF_CACHE_DIR:-/mnt/models/hf-cache}:/root/.cache/huggingface
+      - ${MODELS_DIR:-/mnt/models}:/mnt/models:ro          # Mixtral engine + weights
+      - ../tools:/tools:ro                                   # dev tools
     deploy:
       resources:
         reservations:
