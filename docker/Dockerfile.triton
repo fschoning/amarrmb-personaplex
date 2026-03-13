@@ -40,10 +40,12 @@ RUN pip install --no-cache-dir \
     || pip install --no-cache-dir vllm  # fallback to PyPI if NVIDIA index fails
 
 # transformers + sentencepiece (needed by mixtral_brain Python backend)
+# tritonclient for dev tools that run inside the container (test_brain.py etc.)
 RUN pip install --no-cache-dir \
         transformers \
         sentencepiece \
-        accelerate
+        accelerate \
+        "tritonclient[grpc]"
 
 # Copy model repository and scripts into image
 COPY model_repository/ /models/
