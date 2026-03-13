@@ -5,6 +5,7 @@ FROM nvcr.io/nvidia/tritonserver:25.04-py3-sdk AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake ninja-build build-essential git zlib1g-dev libssl-dev \
+        libcurl4-openssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -22,7 +23,7 @@ RUN cmake -GNinja -B build_dir \
 FROM ubuntu:24.04 AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libssl3t64 zlib1g ca-certificates curl \
+        libssl3t64 zlib1g ca-certificates curl libcurl4t64 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy binary and runtime libs from builder

@@ -1,106 +1,171 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 // SPDX-License-Identifier: MIT
 //
-// gateway/src/brain_client.cpp — Triton gRPC client for the "brain" LLM model
+// gateway/src/brain_client.cpp — HTTP client for the brain FastAPI server
+//
+// Uses libcurl for HTTP POST/GET.  The brain server runs at http://<host>:<port>
+// and provides:
+//   POST /generate  {"prompt": "...", "max_tokens": 64} → {"response": "..."}
+//   GET  /health    → {"status": "ready"}
 
 #include "brain_client.h"
 
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
-#include <vector>
+#include <curl/curl.h>
 
 namespace pg {
 
-BrainClient::BrainClient(const std::string& triton_url,
-                         const std::string& model_name)
+// ── curl write callback ─────────────────────────────────────────────────────
+static size_t write_callback(void* contents, size_t size, size_t nmemb,
+                             std::string* output) {
+    size_t total = size * nmemb;
+    output->append(static_cast<char*>(contents), total);
+    return total;
+}
+
+// ── Constructor ─────────────────────────────────────────────────────────────
+BrainClient::BrainClient(const std::string& url, const std::string& model_name)
     : model_name_(model_name)
 {
-    tc::Error err = tc::InferenceServerGrpcClient::Create(&client_, triton_url,
-                                                          /*verbose=*/false);
-    if (!err.IsOk()) {
-        throw std::runtime_error("BrainClient: failed to connect to Triton at "
-                                 + triton_url + ": " + err.Message());
+    // Normalize URL: ensure http:// prefix
+    if (url.find("://") == std::string::npos) {
+        base_url_ = "http://" + url;
+    } else {
+        base_url_ = url;
     }
+    // Remove trailing slash
+    while (!base_url_.empty() && base_url_.back() == '/') {
+        base_url_.pop_back();
+    }
+    fprintf(stderr, "[brain] HTTP client targeting %s\n", base_url_.c_str());
 }
 
+// ── is_ready ────────────────────────────────────────────────────────────────
 bool BrainClient::is_ready() const {
-    bool ready = false;
-    tc::Error err = client_->IsModelReady(&ready, model_name_);
-    return err.IsOk() && ready;
+    try {
+        std::string resp = http_get(base_url_ + "/health", 5);
+        return resp.find("\"ready\"") != std::string::npos;
+    } catch (...) {
+        return false;
+    }
 }
 
+// ── query ───────────────────────────────────────────────────────────────────
 std::string BrainClient::query(const std::string& prompt, int32_t max_tokens) {
-    // ── PROMPT input ───────────────────────────────────────────────────────
-    tc::InferInput* prompt_inp_raw = nullptr;
-    std::vector<int64_t> prompt_shape = {1};
-    tc::Error err = tc::InferInput::Create(&prompt_inp_raw, "PROMPT",
-                                           prompt_shape, "BYTES");
-    if (!err.IsOk()) {
-        std::cerr << "[brain] InferInput PROMPT failed: " << err.Message() << "\n";
-        return "";
-    }
-    std::shared_ptr<tc::InferInput> prompt_inp(prompt_inp_raw);
-
-    // Triton BYTES: 4-byte little-endian length prefix + data
-    uint32_t plen = static_cast<uint32_t>(prompt.size());
-    std::vector<uint8_t> prompt_bytes(4 + prompt.size());
-    memcpy(prompt_bytes.data(), &plen, 4);
-    memcpy(prompt_bytes.data() + 4, prompt.data(), prompt.size());
-    err = prompt_inp->AppendRaw(prompt_bytes.data(), prompt_bytes.size());
-    if (!err.IsOk()) {
-        std::cerr << "[brain] PROMPT AppendRaw failed: " << err.Message() << "\n";
-        return "";
+    // Build JSON body.  Escape the prompt for JSON.
+    std::string escaped;
+    escaped.reserve(prompt.size() + 64);
+    for (char c : prompt) {
+        switch (c) {
+            case '"':  escaped += "\\\""; break;
+            case '\\': escaped += "\\\\"; break;
+            case '\n': escaped += "\\n";  break;
+            case '\r': escaped += "\\r";  break;
+            case '\t': escaped += "\\t";  break;
+            default:   escaped += c;      break;
+        }
     }
 
-    // ── MAX_TOKENS input ───────────────────────────────────────────────────
-    tc::InferInput* max_tok_inp_raw = nullptr;
-    std::vector<int64_t> max_tok_shape = {1};
-    err = tc::InferInput::Create(&max_tok_inp_raw, "MAX_TOKENS",
-                                 max_tok_shape, "INT32");
-    if (!err.IsOk()) {
-        std::cerr << "[brain] InferInput MAX_TOKENS failed: " << err.Message() << "\n";
+    std::string body = "{\"prompt\":\"" + escaped + "\",\"max_tokens\":" +
+                       std::to_string(max_tokens) + "}";
+
+    try {
+        std::string resp = http_post(base_url_ + "/generate", body, 120);
+
+        // Parse "response" field from JSON — simple extraction
+        // Looking for: "response":"<value>"
+        const std::string key = "\"response\":\"";
+        auto pos = resp.find(key);
+        if (pos == std::string::npos) {
+            // Try alternate format: "response": "..."
+            const std::string key2 = "\"response\": \"";
+            pos = resp.find(key2);
+            if (pos == std::string::npos) {
+                std::cerr << "[brain] response field not found in: "
+                          << resp.substr(0, 200) << "\n";
+                return "";
+            }
+            pos += key2.size();
+        } else {
+            pos += key.size();
+        }
+
+        // Find closing quote (handle escaped quotes)
+        std::string result;
+        for (size_t i = pos; i < resp.size(); ++i) {
+            if (resp[i] == '\\' && i + 1 < resp.size()) {
+                char next = resp[i + 1];
+                if (next == '"')  { result += '"'; ++i; }
+                else if (next == '\\') { result += '\\'; ++i; }
+                else if (next == 'n')  { result += '\n'; ++i; }
+                else if (next == 'r')  { result += '\r'; ++i; }
+                else if (next == 't')  { result += '\t'; ++i; }
+                else { result += resp[i]; }
+            } else if (resp[i] == '"') {
+                break;  // end of value
+            } else {
+                result += resp[i];
+            }
+        }
+        return result;
+
+    } catch (const std::exception& e) {
+        std::cerr << "[brain] HTTP query failed: " << e.what() << "\n";
         return "";
     }
-    std::shared_ptr<tc::InferInput> max_tok_inp(max_tok_inp_raw);
-    err = max_tok_inp->AppendRaw(
-        reinterpret_cast<const uint8_t*>(&max_tokens), sizeof(int32_t));
-    if (!err.IsOk()) {
-        std::cerr << "[brain] MAX_TOKENS AppendRaw failed: " << err.Message() << "\n";
-        return "";
+}
+
+// ── HTTP POST ───────────────────────────────────────────────────────────────
+std::string BrainClient::http_post(const std::string& url,
+                                   const std::string& json_body,
+                                   long timeout_s) {
+    CURL* curl = curl_easy_init();
+    if (!curl) throw std::runtime_error("curl_easy_init failed");
+
+    std::string response;
+    struct curl_slist* headers = nullptr;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_s);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+
+    CURLcode res = curl_easy_perform(curl);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    if (res != CURLE_OK) {
+        throw std::runtime_error(std::string("curl POST failed: ") +
+                                 curl_easy_strerror(res));
     }
+    return response;
+}
 
-    // ── RESPONSE output ────────────────────────────────────────────────────
-    tc::InferRequestedOutput* resp_out_raw = nullptr;
-    err = tc::InferRequestedOutput::Create(&resp_out_raw, "RESPONSE");
-    if (!err.IsOk()) {
-        std::cerr << "[brain] InferRequestedOutput failed: " << err.Message() << "\n";
-        return "";
+// ── HTTP GET ────────────────────────────────────────────────────────────────
+std::string BrainClient::http_get(const std::string& url, long timeout_s) {
+    CURL* curl = curl_easy_init();
+    if (!curl) throw std::runtime_error("curl_easy_init failed");
+
+    std::string response;
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_s);
+
+    CURLcode res = curl_easy_perform(curl);
+    curl_easy_cleanup(curl);
+
+    if (res != CURLE_OK) {
+        throw std::runtime_error(std::string("curl GET failed: ") +
+                                 curl_easy_strerror(res));
     }
-    std::shared_ptr<tc::InferRequestedOutput> resp_out(resp_out_raw);
-
-    // ── Infer ──────────────────────────────────────────────────────────────
-    std::vector<tc::InferInput*>            inputs  = {prompt_inp.get(), max_tok_inp.get()};
-    std::vector<const tc::InferRequestedOutput*> outputs = {resp_out.get()};
-
-    tc::InferOptions opts(model_name_);
-
-    tc::InferResult* result_raw = nullptr;
-    err = client_->Infer(&result_raw, opts, inputs, outputs);
-    if (!err.IsOk()) {
-        std::cerr << "[brain] Infer failed: " << err.Message() << "\n";
-        return "";
-    }
-    std::shared_ptr<tc::InferResult> result(result_raw);
-
-    // ── Decode BYTES output ────────────────────────────────────────────────
-    std::vector<std::string> str_results;
-    err = result->StringData("RESPONSE", &str_results);
-    if (!err.IsOk() || str_results.empty()) {
-        std::cerr << "[brain] StringData failed: " << err.Message() << "\n";
-        return "";
-    }
-    return str_results[0];
+    return response;
 }
 
 } // namespace pg

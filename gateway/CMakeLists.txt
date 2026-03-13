@@ -57,6 +57,9 @@ find_library(GRPCPP_LIB   grpc++    HINTS ${TRITON_CLIENT_DIR}/lib /usr/local/li
 find_library(GPR_LIB      gpr       HINTS ${TRITON_CLIENT_DIR}/lib /usr/local/lib)
 find_library(PROTOBUF_LIB protobuf  HINTS ${TRITON_CLIENT_DIR}/lib /usr/local/lib)
 
+# libcurl — for brain_client HTTP requests
+find_package(CURL REQUIRED)
+
 # ---------------------------------------------------------------------------
 # Gateway executable
 # ---------------------------------------------------------------------------
@@ -85,6 +88,7 @@ set(_LINK_LIBS
     simdjson
     pthread
     z
+    CURL::libcurl
 )
 foreach(_lib GRPCPP_LIB GRPC_LIB GPR_LIB PROTOBUF_LIB)
     if(${_lib})

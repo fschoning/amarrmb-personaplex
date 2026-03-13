@@ -68,12 +68,12 @@ services:
       start_period: 120s
 
   # -------------------------------------------------------------------------
-  # Brain Triton — SmolLM3-3B NVFP4 via TRT-LLM (separate process for MPS)
-  # Uses official TRT-LLM Triton image so tensorrt_llm is available.
+  # Brain — SmolLM3-3B NVFP4 via TRT-LLM (FastAPI, separate process for MPS)
+  # Uses spark-single-gpu-dev image (has tensorrt_llm for NVFP4 engine)
   # With MPS: gets 10-20% of GPU SMs (background, latency not critical)
   # -------------------------------------------------------------------------
   brain:
-    image: nvcr.io/nvidia/tritonserver:26.02-trtllm-python-py3
+    image: nvcr.io/nvidia/tensorrt-llm/release:spark-single-gpu-dev
     restart: unless-stopped
     shm_size: '2gb'
     ipc: host                    # required for MPS daemon communication
@@ -81,18 +81,16 @@ services:
       - 8.8.8.8
       - 8.8.4.4
     ports:
-      - "8011:8011"   # gRPC (different port from triton)
-      - "8010:8010"   # HTTP
-      - "8012:8012"   # metrics
-    entrypoint: ["/bin/bash", "/scripts/start_triton.sh"]
+      - "8015:8015"              # FastAPI HTTP
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        pip install -q fastapi uvicorn 2>/dev/null
+        python3 /scripts/server_brain.py
     environment:
-      MODEL_REPO:          "/models"
-      BRAIN_ONLY:        "1"         # only load brain model
-      GRPC_PORT:         "8011"
-      HTTP_PORT:         "8010"
-      METRICS_PORT:      "8012"
       BRAIN_ENGINE:      "${BRAIN_ENGINE:-/mnt/models/smollm3-3b-nvfp4-engine}"
       BRAIN_MODEL:       "${BRAIN_MODEL:-/mnt/models/smollm3-3b}"
+      BRAIN_PORT:        "8015"
       HF_TOKEN:          "${HF_TOKEN:-}"
       HF_HUB_OFFLINE:    "1"
       TRANSFORMERS_OFFLINE: "1"
@@ -102,8 +100,7 @@ services:
       - ${HF_CACHE_DIR:-/mnt/models/hf-cache}:/root/.cache/huggingface
       - ${MODELS_DIR:-/mnt/models}:/mnt/models:ro
       - /tmp/nvidia-mps:/tmp/nvidia-mps    # MPS daemon pipe
-      - ../model_repository:/models:ro     # brain model.py + config
-      - ../scripts:/scripts:ro             # start_triton.sh
+      - ../scripts:/scripts:ro             # server_brain.py
     deploy:
       resources:
         reservations:
@@ -112,12 +109,11 @@ services:
               count: 1
               capabilities: [gpu]
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8010/v2/health/live"]
+      test: ["CMD", "curl", "-sf", "http://localhost:8015/health"]
       interval: 15s
       timeout: 10s
       retries: 12
       start_period: 180s
-   # brain model load is slower
 
   # -------------------------------------------------------------------------
   # C++ Gateway (WebSocket → Triton gRPC)
@@ -136,7 +132,7 @@ services:
         condition: service_healthy
     environment:
       TRITON_GRPC_URL:    "localhost:8001"      # PP pipeline
-      BRAIN_GRPC_URL:     "localhost:8011"      # Brain (separate container)
+      BRAIN_GRPC_URL:     "localhost:8015"      # Brain FastAPI HTTP
       MAX_SESSIONS:       "${MAX_SESSIONS:-6}"
       SESSION_TIMEOUT_S:  "${SESSION_TIMEOUT_S:-300}"
       WS_PORT:            "${WS_PORT:-8998}"
