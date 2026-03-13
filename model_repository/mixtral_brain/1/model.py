@@ -89,10 +89,10 @@ def _try_vllm(model_dir: str, logger):
             model=model_dir,
             quantization=quant,             # "awq"/"gptq"/None
             dtype="bfloat16",
-            gpu_memory_utilization=0.28,    # leave ~72% for 2× PersonaPlex
-            max_model_len=6144,
+            gpu_memory_utilization=0.38,    # ~36GB of 96GB total; ~40GB free after 2× PersonaPlex
+            max_model_len=1024,             # brain prompts are short; limits KV cache size
             trust_remote_code=True,
-            enforce_eager=True,             # skip CUDA graph capture (more stable)
+            enforce_eager=True,             # skip CUDA graph capture
             enable_prefix_caching=False,
         )
         logger.log_info(f"mixtral_brain: loaded via vLLM from {model_dir} (quant={quant})")
