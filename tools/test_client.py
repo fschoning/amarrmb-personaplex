@@ -82,10 +82,12 @@ def pcm16_bytes_to_float32(data: bytes):
 # Client
 # ---------------------------------------------------------------------------
 class PersonaPlexClient:
-    def __init__(self, url: str, prompt: str = "", voice_prompt_path: str = None):
+    def __init__(self, url: str, prompt: str = "", voice_prompt_path: str = None,
+                 persona: str = ""):
         self.url = url
         self.prompt = prompt
         self.voice_prompt_path = voice_prompt_path
+        self.persona = persona
         self.ws = None
         self.session_id = None
         self.session_ready = asyncio.Event()
@@ -150,6 +152,8 @@ class PersonaPlexClient:
             "temperature": 0.8,
             "top_k": 250,
         }
+        if self.persona:
+            session_cfg["persona_prompt"] = self.persona
 
         # Attach voice prompt: either a local .pt file or a voice NAME
         if self.voice_prompt_path:
@@ -463,6 +467,9 @@ async def main():
     parser.add_argument("--duration", type=float, default=10.0, help="Loopback/mic duration (s)")
     parser.add_argument("--save", default=None, help="Save output audio to .wav file")
     parser.add_argument("--tls", action="store_true", help="Use wss:// instead of ws://")
+    parser.add_argument("--persona", default="",
+                        help="Persona for the brain LLM (context switching). "
+                             "e.g. 'You are Jane, an enthusiastic science expert.'")
     args = parser.parse_args()
 
     # Interactive voice selection (returns voice NAME, server loads .pt)
@@ -472,7 +479,7 @@ async def main():
     scheme = "wss" if args.tls else "ws"
     url = f"{scheme}://{args.host}:{args.port}/v1/realtime"
 
-    client = PersonaPlexClient(url, args.prompt, args.voice_prompt)
+    client = PersonaPlexClient(url, args.prompt, args.voice_prompt, persona=args.persona)
 
     try:
         await client.connect()
