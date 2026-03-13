@@ -45,7 +45,7 @@ def load_model():
     if os.path.isdir(ENGINE_DIR) and os.path.isfile(os.path.join(ENGINE_DIR, "rank0.engine")):
         try:
             from tensorrt_llm._tensorrt_engine import LLM as TrtLLM
-            engine = TrtLLM(model=ENGINE_DIR)
+            engine = TrtLLM(model=ENGINE_DIR, tokenizer=MODEL_DIR)
             backend = "trtllm-cpp"
             log.info(f"Loaded TRT-LLM C++ engine from {ENGINE_DIR}")
             return
@@ -108,8 +108,10 @@ def generate(prompt: str, max_tokens: int = 64) -> str:
 
     if backend == "trtllm-cpp":
         from tensorrt_llm import SamplingParams as TrtSamplingParams
+        eos_id = tokenizer.eos_token_id or 2
         params = TrtSamplingParams(
             max_tokens=max_tokens, temperature=0.7, top_p=0.9,
+            end_id=eos_id, pad_id=eos_id,
         )
         outputs = engine.generate([formatted], sampling_params=params)
         if hasattr(outputs[0], 'text'):
