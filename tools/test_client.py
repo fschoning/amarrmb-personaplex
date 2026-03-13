@@ -25,6 +25,7 @@ import base64
 import json
 import os
 import queue
+import ssl
 import struct
 import sys
 import threading
@@ -132,13 +133,14 @@ class PersonaPlexClient:
             except Exception:
                 break
 
-    async def connect(self):
+    async def connect(self, ssl_context=None):
         print(f"Connecting to {self.url} ...")
         self.ws = await websockets.connect(
             self.url,
             max_size=16 * 1024 * 1024,
             ping_interval=30,
             ping_timeout=60,
+            ssl=ssl_context,
         )
         self.connected.set()
         print("Connected!")
@@ -467,6 +469,9 @@ async def main():
     parser.add_argument("--duration", type=float, default=10.0, help="Loopback/mic duration (s)")
     parser.add_argument("--save", default=None, help="Save output audio to .wav file")
     parser.add_argument("--tls", action="store_true", help="Use wss:// instead of ws://")
+    parser.add_argument("--no-verify-ssl", "--insecure", dest="no_verify_ssl",
+                        action="store_true",
+                        help="Skip TLS cert verification (for self-signed certs)")
     parser.add_argument("--persona", default="",
                         help="Persona for the brain LLM (context switching). "
                              "e.g. 'You are Jane, an enthusiastic science expert.'")
@@ -479,10 +484,19 @@ async def main():
     scheme = "wss" if args.tls else "ws"
     url = f"{scheme}://{args.host}:{args.port}/v1/realtime"
 
+    # SSL context for wss:// — disable cert verification for self-signed certs
+    ssl_ctx = None
+    if args.tls:
+        ssl_ctx = ssl.create_default_context()
+        if args.no_verify_ssl:
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = ssl.CERT_NONE
+            print("  WARNING: SSL certificate verification disabled")
+
     client = PersonaPlexClient(url, args.prompt, args.voice_prompt, persona=args.persona)
 
     try:
-        await client.connect()
+        await client.connect(ssl_context=ssl_ctx)
 
         # Start receiver in background
         recv_task = asyncio.create_task(client.receive_loop())
