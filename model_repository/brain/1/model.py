@@ -160,13 +160,23 @@ class TritonPythonModel:
 
         self.logger.log_info(f"brain: ready (backend={self._backend}, model={_MODEL_DIR})")
 
-        # --- Warmup ---
+        # --- Warmup: must exercise FLA linear attention code paths ---
+        # The first vLLM generate triggers triton kernel JIT for Qwen 3.5's
+        # hybrid attention layers. Use a realistic-length prompt to cover
+        # both standard attention and FLA code paths.
         if self._backend == "vllm":
-            self.logger.log_info("brain: warming up vLLM...")
+            self.logger.log_info("brain: warming up vLLM (JIT compiling FLA kernels)...")
             t0 = time.monotonic()
             try:
-                params = self._vllm_params(temperature=0.7, top_p=0.9, max_tokens=16)
-                self._vllm.generate(["Hello"], params)
+                warmup_prompt = self._format_prompt(
+                    "This is a warmup prompt to trigger kernel compilation. "
+                    "The brain model uses hybrid attention with both standard "
+                    "multi-head attention and flash linear attention layers. "
+                    "Each unique sequence length may trigger JIT compilation "
+                    "of triton kernels for the FLA layers."
+                )
+                params = self._vllm_params(temperature=0.7, top_p=0.9, max_tokens=32)
+                self._vllm.generate([warmup_prompt], params)
                 self.logger.log_info(f"brain: warmup done in {time.monotonic() - t0:.1f}s")
             except Exception as e:
                 self.logger.log_info(f"brain: warmup failed ({e}), first request will be slow")
@@ -255,21 +265,37 @@ class TritonPythonModel:
         text = re.sub(r'<think>.*$', '', text, flags=re.DOTALL)
         return text.strip()
 
-    @staticmethod
-    def _format_prompt(prompt: str) -> str:
-        """Wrap in Qwen chat template with /no_think to disable chain-of-thought."""
+    def _format_prompt(self, prompt: str) -> str:
+        """Format prompt using tokenizer's chat template with thinking disabled."""
         prompt = prompt.strip()
-        if "<|im_start|>" not in prompt and "[INST]" not in prompt:
-            prompt = (
-                "<|im_start|>system\n"
-                "You are a concise AI assistant. Respond directly without internal reasoning. /no_think\n"
-                "<|im_end|>\n"
-                f"<|im_start|>user\n{prompt}<|im_end|>\n"
-                "<|im_start|>assistant\n"
-            )
-        elif not prompt.startswith("[INST]"):
-            prompt = f"[INST] {prompt} [/INST]"
-        return prompt
+        if "<|im_start|>" in prompt or "[INST]" in prompt:
+            return prompt  # already formatted
+
+        messages = [
+            {"role": "system", "content": "You are a concise AI assistant. Respond directly."},
+            {"role": "user", "content": prompt},
+        ]
+
+        # Use tokenizer's native chat template if available (handles thinking mode)
+        if self._hf_tok is not None and hasattr(self._hf_tok, 'apply_chat_template'):
+            try:
+                return self._hf_tok.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,  # Qwen 3.5 native thinking control
+                )
+            except TypeError:
+                pass  # tokenizer doesn't support enable_thinking kwarg
+
+        # Fallback: manual Qwen chat format
+        return (
+            "<|im_start|>system\n"
+            "You are a concise AI assistant. Respond directly. /no_think\n"
+            "<|im_end|>\n"
+            f"<|im_start|>user\n{prompt}<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
 
     def finalize(self):
         self._trtllm   = None
