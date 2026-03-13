@@ -41,10 +41,10 @@ instance_group [
     kind: KIND_GPU
     gpus: [0]
     rate_limiter {
-      # Priority 1 = highest.  PP is scheduled before brain when both
-      # have pending requests.  No shared resource — both can use GPU
-      # concurrently.  This avoids the 5.9s freeze caused by the
-      # gpu_compute mutex while brain was generating.
+      # Priority 1 = highest.  PP is scheduled before brain.
+      # No resource mutex: brain chunked generation (8 tok/call + 200ms
+      # sleep) creates natural GPU idle windows.  During sleep, brain
+      # launches zero CUDA kernels -> PP gets full GPU bandwidth.
       priority: 1
     }
   }

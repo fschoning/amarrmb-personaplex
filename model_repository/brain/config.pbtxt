@@ -13,8 +13,9 @@ output [
 
 # Single instance — brain runs one request at a time
 # Priority 10 = LOWEST. PP (priority 1) is scheduled first.
-# No shared resource — both models use GPU concurrently.
-# Brain may be slower but PP frames are never blocked.
+# Chunked generation (8 tok/call + 200ms sleep) creates natural GPU
+# idle windows.  During sleep, brain launches zero CUDA kernels and
+# PP gets full GPU bandwidth for clean 70ms frames.
 instance_group [
   {
     count: 1
