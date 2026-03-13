@@ -7,8 +7,21 @@
 #include <cstdint>
 #include <cstdlib>
 #include <string>
+#include <vector> // Added for std::vector
 
 namespace pg {
+
+// Session-specific configuration, sent by client at session start
+struct SessionConfig {
+    std::string              instructions;           // text system prompt
+    std::string              voice_prompt_embedding; // base64-encoded .pt bytes
+    std::vector<int32_t>     text_prompt_tokens;     // optional: voice name as int32 sentinel
+    std::string              persona_prompt;         // orchestrator persona (for brain LLM)
+    std::string              input_audio_format  = "pcm16";
+    std::string              output_audio_format = "pcm16";
+    float                    temperature         = 0.8f;
+    int                      top_k               = 250;
+};
 
 struct Config {
     // WebSocket server
@@ -27,7 +40,9 @@ struct Config {
     int         session_timeout_s = 300;      // idle timeout before forceful close
     int         audio_buffer_ms   = 2000;     // ring buffer depth (ms at 24kHz)
 
-    // Model names in Triton
+    // Silence detection for Ping-Pong switch
+    float       silence_threshold   = 0.005f;    // RMS below this = silent
+    int         silence_hold_frames = 4;         // 4 × 80ms = 320ms silence window
     std::string pipeline_model = "personaplex_pipeline";
     int64_t     model_version  = -1;          // -1 = latest
 

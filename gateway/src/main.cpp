@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 // SPDX-License-Identifier: MIT
 //
-// gateway/src/main.cpp — PersonaPlex v2 Gateway
+// gateway/src/main.cpp — PersonaPlex v2 Gateway with Ping-Pong Orchestrator
 //
 // Architecture:
 //   uWS event loop thread:
@@ -12,13 +12,11 @@
 //
 //   Session worker thread (one per active session):
 //     1. Wait for config (session.update from client)
-//     2. decode voice_prompt_embedding (base64 → bytes)
-//     3. send_start() to Triton  <-- blocks ~2-5s (system prompts)
-//     4. send session.ready to client via loop->defer()
-//     5. Loop: pop 1920 samples from ring buffer → send_frame() → encode_audio_delta()
-//     6. send_end(), exit.
+//     2. Create Orchestrator (owns hot + standby TritonSessions + BrainClient)
+//     3. Orchestrator.run() drives the Ping-Pong loop until disconnect
 
 #include "config.h"
+#include "orchestrator.h"
 #include "session.h"
 #include "protocol.h"
 #include "triton_client.h"
@@ -51,14 +49,13 @@ static void sighandler(int) {
 }
 
 // ---------------------------------------------------------------------------
-// Session worker: runs Triton inference for one session
+// Session worker: creates and drives the Orchestrator for one session
 // ---------------------------------------------------------------------------
 static void session_worker(std::shared_ptr<Session> sess,
                             const Config& cfg,
                             uWS::Loop* loop)
 {
-    // Helper: safely post a JSON string to the client
-    // Must go via loop->defer() because uWS is single-threaded.
+    // Helper: safely post a JSON string to the client via the uWS event loop
     auto send = [&](std::string msg) {
         std::string m = std::move(msg);
         loop->defer([sess, m = std::move(m)]() mutable {
@@ -72,86 +69,20 @@ static void session_worker(std::shared_ptr<Session> sess,
 
     if (sess->should_close.load()) return;
 
-    // --- 2. Decode voice prompt bytes ---
-    std::vector<uint8_t> voice_bytes;
-    if (!sess->config.voice_prompt_embedding.empty()) {
-        voice_bytes = base64_decode(sess->config.voice_prompt_embedding);
-    }
+    fprintf(stderr, "[worker] session %s: starting Orchestrator (voice_bytes=%zu, persona='%.40s')\n",
+            sess->session_id.c_str(),
+            sess->config.voice_prompt_embedding.size(),
+            sess->config.persona_prompt.c_str());
 
-    // Text prompt tokens (may contain voice name encoded as int32 sentinel)
-    std::vector<int32_t> text_tokens = sess->config.text_prompt_tokens;
-
-    fprintf(stderr, "[worker] session %s: voice_bytes=%zu text_tokens=%zu\n",
-            sess->session_id.c_str(), voice_bytes.size(), text_tokens.size());
-
-    // --- 3. Triton START (blocks during system prompt conditioning) ---
-    std::string resp_id  = "resp_" + sess->session_id;
-    std::string item_id  = "item_" + sess->session_id;
-
-    TritonSession ts(cfg.triton_url, cfg.pipeline_model, sess->corrid, cfg.model_version);
-
-    fprintf(stderr, "[worker] session %s: sending START to Triton...\n",
-            sess->session_id.c_str());
-
+    // --- 2. Run the Orchestrator (blocks until session ends) ---
     try {
-        bool ok = ts.send_start(voice_bytes, text_tokens);
-        fprintf(stderr, "[worker] session %s: Triton START returned ok=%d\n",
-                sess->session_id.c_str(), ok);
-        if (!ok || sess->should_close.load()) {
-            send(make_error("server_error", "Triton start failed", ""));
-            return;
-        }
+        Orchestrator orch(cfg, sess, send);
+        orch.run();
     } catch (const std::exception& e) {
-        fprintf(stderr, "[worker] session %s: Triton exception: %s\n",
+        fprintf(stderr, "[worker] session %s: Orchestrator exception: %s\n",
                 sess->session_id.c_str(), e.what());
-        send(make_error("server_error", std::string("Triton: ") + e.what(), ""));
-        return;
+        send(make_error("server_error", std::string("Orchestrator: ") + e.what(), ""));
     }
-
-    // --- 4. Signal client that we are ready ---
-    sess->triton_ready.store(true);
-    send(make_session_ready(sess->session_id));
-
-    // --- 5. Inference loop (80ms frames) ---
-    std::vector<float> frame_buf(FRAME_SAMPLES_24K);
-
-    while (!sess->should_close.load()) {
-        size_t got = sess->audio_in.pop(frame_buf.data(), FRAME_SAMPLES_24K, /*timeout_ms=*/200);
-        if (got == 0) continue;  // timeout — try again (allows checking should_close)
-
-        FrameOutput out;
-        bool ok = false;
-        try {
-            ok = ts.send_frame(frame_buf.data(), FRAME_SAMPLES_24K, out);
-        } catch (const std::exception& e) {
-            std::cerr << "[worker:" << sess->session_id << "] Triton error: " << e.what() << "\n";
-            break;
-        }
-
-        if (!ok) break;
-
-        // Audio delta — 48kHz PCM float32 → base64 PCM16
-        if (!out.pcm_48k.empty()) {
-            std::string b64 = encode_audio_delta(out.pcm_48k.data(), out.pcm_48k.size());
-            send(make_audio_delta(resp_id, item_id, b64));
-        }
-
-        // Text token — log for Phase 0 transcript analysis.
-        // Log every token (including 0) for every 25th frame, plus non-zero always.
-        static int frame_count = 0;
-        ++frame_count;
-        if (out.text_token > 0 && out.text_token < 32000) {
-            fprintf(stderr, "[tok] %.8s %d\n",
-                    sess->session_id.c_str(), out.text_token);
-        } else if (frame_count % 25 == 0) {
-            fprintf(stderr, "[tok-dbg] %.8s frame=%d token=%d\n",
-                    sess->session_id.c_str(), frame_count, out.text_token);
-        }
-    }
-
-    // --- 6. Clean END ---
-    try { ts.send_end(); } catch (...) {}
-    send(make_audio_done(resp_id));
 }
 
 // ---------------------------------------------------------------------------

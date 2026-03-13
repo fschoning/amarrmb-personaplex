@@ -4,6 +4,7 @@
 // gateway/src/protocol.h — OpenAI Realtime API event types
 
 #pragma once
+#include "config.h"    // SessionConfig lives here
 #include <string>
 #include <vector>
 #include <optional>
@@ -24,15 +25,8 @@ enum class ClientEventType {
     ResponseCancel,         // response.cancel
 };
 
-struct SessionConfig {
-    std::string              instructions;           // text system prompt
-    std::string              voice_prompt_embedding; // base64-encoded .pt bytes
-    std::vector<int32_t>     text_prompt_tokens;     // optional: voice name as int32 sentinel
-    std::string              input_audio_format  = "pcm16";
-    std::string              output_audio_format = "pcm16";
-    float                    temperature         = 0.8f;
-    int                      top_k               = 250;
-};
+// SessionConfig is defined in config.h
+
 
 struct ClientEvent {
     ClientEventType         type      = ClientEventType::Unknown;

@@ -157,8 +157,12 @@ bool parse_client_event(const char* data, size_t len, ClientEvent& out) {
                 }
             }
         } catch (...) {
-            // Field missing or not an array — that's fine, voice is optional
+            // Field missing or not an array — voice is optional
         }
+
+        // persona_prompt — optional string for the brain LLM
+        if (sess["persona_prompt"].get(sv) == simdjson::SUCCESS)
+            out.session.persona_prompt = std::string(sv);
 
     } else if (type_str == "input_audio_buffer.append") {
         out.type = ClientEventType::InputAudioBufferAppend;

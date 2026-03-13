@@ -66,6 +66,8 @@ add_executable(personaplex_gateway
     src/protocol.cpp
     src/session.cpp
     src/triton_client.cpp
+    src/orchestrator.cpp
+    src/brain_client.cpp
 )
 
 target_include_directories(personaplex_gateway PRIVATE
