@@ -260,7 +260,7 @@ void Orchestrator::request_brain_async(const std::string& prompt) {
     brain_thread_ = std::thread([this, prompt]() {
         fprintf(stderr, "[brain] querying (prompt_len=%zu)...\n", prompt.size());
         auto t0   = std::chrono::steady_clock::now();
-        std::string response = brain_->query(prompt, 256);
+        std::string response = brain_->query(prompt, 64);  // 64 tokens ≈ 6s, minimize GPU contention
         auto ms   = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - t0).count();
         fprintf(stderr, "[brain] response in %ldms: %.80s...\n", ms, response.c_str());
@@ -372,18 +372,24 @@ bool Orchestrator::should_trigger_brain() const {
 // build_brain_prompt — assemble the prompt to send to the brain LLM
 // ---------------------------------------------------------------------------
 std::string Orchestrator::build_brain_prompt(const std::string& persona) const {
+    int n_tokens = transcript_.size();
+
+    // NOTE: text_tokens from PersonaPlex are audio-codebook IDs, not text.
+    // We cannot decode them to words without SentencePiece (Phase 4).
+    // Instead, give the brain the metadata it CAN act on.
     std::ostringstream oss;
-    oss << "You are a conversation context compiler for a voice AI system.\n"
-        << "The AI persona: " << persona << "\n\n"
-        << "The AI's recent speech (as language model token IDs):\n"
-        << transcript_.as_text() << "\n\n"
-        << "Compile a BOOT_PAYLOAD for the next AI instance to continue this "
-        << "conversation seamlessly. Include:\n"
-        << "1. [SUMMARY] 2-3 sentence summary of what was discussed\n"
-        << "2. [CONTEXT] Any facts or follow-up the AI should know\n"
-        << "3. [EMOTION] One sentence on conversation tone\n"
-        << "4. [PERSONA] " << persona << "\n"
-        << "Be concise. The total must fit in 200 words.";
+    oss << "You are writing a context handoff note for a voice AI."
+        << " The AI's persona: " << persona << "\n"
+        << "The AI has been speaking continuously for approximately "
+        << (frame_no_ * 80 / 1000) << " seconds."
+        << " During this time it generated " << n_tokens << " speech token(s)."
+        << " It is having a natural conversation with a user.\n\n"
+        << "Write a short BOOT_PAYLOAD (max 60 words) for the \"next instance\" of this AI "
+        << "so it can continue the conversation naturally. Structure:\n"
+        << "[SUMMARY] What the AI was probably discussing (infer from persona + time)\n"
+        << "[CONTEXT] Any relevant knowledge the AI should have ready\n"
+        << "[EMOTION] Tone of voice to match (warm, curious, etc)\n"
+        << "[PERSONA] " << persona;
     return oss.str();
 }
 
