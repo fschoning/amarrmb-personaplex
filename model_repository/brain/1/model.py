@@ -216,7 +216,11 @@ class TritonPythonModel:
             response_text = self._generate_hf(prompt, max_tokens)
 
         elapsed = time.monotonic() - t0
-        self.logger.log_info(f"brain: done in {elapsed:.2f}s, {len(response_text.split())} words")
+        n_words = len(response_text.split())
+        self.logger.log_info(
+            f"brain: done in {elapsed:.2f}s, {n_words} words, "
+            f"~{n_words / max(elapsed, 0.01):.1f} words/s"
+        )
 
         out_arr = np.array([[response_text.encode("utf-8")]], dtype=object)
         return pb_utils.InferenceResponse(output_tensors=[
@@ -242,7 +246,33 @@ class TritonPythonModel:
     def _generate_vllm(self, prompt: str, max_tokens: int) -> str:
         params = self._vllm_params(temperature=0.7, top_p=0.9, max_tokens=max_tokens)
         outputs = self._vllm.generate([self._format_prompt(prompt)], params)
-        return self._strip_thinking(outputs[0].outputs[0].text.strip())
+        result = outputs[0]
+
+        # Extract detailed metrics from vLLM RequestOutput
+        out_text = result.outputs[0].text.strip()
+        n_prompt = len(result.prompt_token_ids) if result.prompt_token_ids else 0
+        n_output = len(result.outputs[0].token_ids) if result.outputs[0].token_ids else 0
+        metrics  = getattr(result, 'metrics', None)
+        if metrics:
+            prefill_ms = getattr(metrics, 'time_to_first_token_ms', 0) or 0
+            total_ms   = getattr(metrics, 'finished_time', 0)
+            # If no fine-grained timing, fall back to elapsed
+            if prefill_ms > 0 and n_prompt > 0:
+                self.logger.log_info(
+                    f"brain: vllm metrics — prompt={n_prompt} toks, "
+                    f"output={n_output} toks, "
+                    f"prefill={prefill_ms:.0f}ms ({n_prompt / max(prefill_ms/1000, 0.001):.0f} tok/s)"
+                )
+            else:
+                self.logger.log_info(
+                    f"brain: vllm metrics — prompt={n_prompt} toks, output={n_output} toks"
+                )
+        else:
+            self.logger.log_info(
+                f"brain: vllm — prompt={n_prompt} toks, output={n_output} toks"
+            )
+
+        return self._strip_thinking(out_text)
 
     def _generate_hf(self, prompt: str, max_tokens: int) -> str:
         import torch
