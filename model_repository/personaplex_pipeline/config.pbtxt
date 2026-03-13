@@ -37,10 +37,11 @@ sequence_batching {
 
 instance_group [
   {
-    count: 2
+    count: 1
     kind: KIND_GPU
     gpus: [0]
     # GPU isolation handled by CUDA MPS (hardware SM partitioning).
-    # No Triton rate_limiter needed — each container gets dedicated SMs.
+    # count=1: second instance OOMs with new SmolLM3 32K engine on GPU.
+    # Hot/standby switching uses separate corrid sequences, not model copies.
   }
 ]
