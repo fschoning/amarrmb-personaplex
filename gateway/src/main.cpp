@@ -136,11 +136,16 @@ static void session_worker(std::shared_ptr<Session> sess,
             send(make_audio_delta(resp_id, item_id, b64));
         }
 
-        // Text token — log raw ID for Phase 0 transcript quality analysis.
-        // Format: "[tok] <session8> <token_id>" — grep for [tok] to extract.
-        if (out.text_token > 0 && out.text_token < 32000 /* vocab size */) {
+        // Text token — log for Phase 0 transcript analysis.
+        // Log every token (including 0) for every 25th frame, plus non-zero always.
+        static int frame_count = 0;
+        ++frame_count;
+        if (out.text_token > 0 && out.text_token < 32000) {
             fprintf(stderr, "[tok] %.8s %d\n",
                     sess->session_id.c_str(), out.text_token);
+        } else if (frame_count % 25 == 0) {
+            fprintf(stderr, "[tok-dbg] %.8s frame=%d token=%d\n",
+                    sess->session_id.c_str(), frame_count, out.text_token);
         }
     }
 
