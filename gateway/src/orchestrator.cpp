@@ -347,7 +347,10 @@ void Orchestrator::execute_switch() {
 bool Orchestrator::should_trigger_brain() const {
     // Trigger every ~10 seconds of speech (125 frames × 80ms = 10s)
     // AND only if we have at least 20 text tokens (some speech happened)
-    constexpr int kTriggerEveryFrames = 125;
+    // Trigger every ~30 seconds of audio (375 frames × 80ms = 30s).
+    // Brain generation takes ~6s → choppy for ~6s every 30s (20% of cycle).
+    // At 10s it was 60% choppy — unacceptable.
+    constexpr int kTriggerEveryFrames = 375;
     constexpr int kMinTokens          = 20;
     return frames_since_trigger_ >= kTriggerEveryFrames
         && transcript_.size() >= kMinTokens;
