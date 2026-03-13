@@ -11,8 +11,7 @@ kernel incompatibility. Use AWQ or standard models instead.
 Set MIXTRAL_MODEL env var to point at any compatible model directory.
 
 Recommended models (already on /mnt/models):
-  /mnt/models/qwen35-27b-awq   — AWQ 4-bit, 27B params, fast
-  /mnt/models/qwen35-35b-a3b   — MoE 35B/3.5B active, very efficient
+  /mnt/models/qwen35-27b-awq   — AWQ 4-bit, ~14GB, works well on GB10
 """
 
 import os
@@ -23,8 +22,8 @@ import triton_python_backend_utils as pb_utils
 
 # ── Config from environment ──────────────────────────────────────────────────
 _ENGINE_DIR  = os.environ.get("MIXTRAL_ENGINE", "/mnt/models/mixtral-engine")
-_MODEL_DIR   = os.environ.get("MIXTRAL_MODEL",  "/mnt/models/qwen35-35b-a3b")
-_HF_MODEL_ID = os.environ.get("MIXTRAL_HF_ID",  "Qwen/Qwen2.5-35B-A3B-Instruct")
+_MODEL_DIR   = os.environ.get("MIXTRAL_MODEL",  "/mnt/models/qwen35-27b-awq")
+_HF_MODEL_ID = os.environ.get("MIXTRAL_HF_ID",  "Qwen/Qwen2.5-27B-Instruct-AWQ")
 _DEVICE      = "cuda"
 _BACKEND     = None   # set during initialize()
 
