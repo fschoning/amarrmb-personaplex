@@ -1,20 +1,17 @@
 # docker/docker-compose.yaml — PersonaPlex v2 full stack
 #
-# MPS MODE (zero choppiness):
-#   1. Start MPS daemon:  sudo bash scripts/start_mps.sh
-#   2. Start stack:       docker compose up -d
-#   3. Stop:              docker compose down && sudo bash scripts/stop_mps.sh
+# Brain runs via OpenRouter (Gemini 2.0 Flash) — no GPU needed for brain.
+# PP gets 100% of the Spark GPU.
 #
-# SINGLE-CONTAINER MODE (legacy, brain+PP on same GPU, choppy during brain):
-#   LOAD_BRAIN=1 USE_MPS=0 docker compose up -d
+# Start:  OPENROUTER_API_KEY=sk-... docker compose up -d
+# Stop:   docker compose down
 
 name: personaplex-v2
 
 services:
 
   # -------------------------------------------------------------------------
-  # Triton Inference Server — PersonaPlex pipeline only
-  # With MPS: gets 80% of GPU SMs (real-time audio, latency-critical)
+  # Triton Inference Server — PersonaPlex pipeline (100% GPU)
   # -------------------------------------------------------------------------
   triton:
     build:
@@ -39,20 +36,15 @@ services:
       PERSONAPLEX_FP8:   "${PERSONAPLEX_FP8:-1}"
       LM_TEMPERATURE:    "${LM_TEMPERATURE:-0.8}"
       LM_TOP_K:          "${LM_TOP_K:-250}"
-      LOAD_BRAIN:        "0"         # brain is in separate container
-      BRAIN_ENGINE:      "${BRAIN_ENGINE:-/mnt/models/smollm3-3b-nvfp4-engine}"
-      BRAIN_MODEL:       "${BRAIN_MODEL:-/mnt/models/smollm3-3b}"
+      LOAD_BRAIN:        "0"
       HF_HUB_OFFLINE:    "1"
       TRANSFORMERS_OFFLINE: "1"
       VLLM_ATTENTION_BACKEND: "FLASH_ATTN"
       VLLM_WORKER_MULTIPROC_METHOD: "spawn"
-      # MPS: limit this container to 80% of GPU SMs
-      CUDA_MPS_ACTIVE_THREAD_PERCENTAGE: "${PP_GPU_PERCENT:-80}"
     volumes:
       - ${HF_CACHE_DIR:-/mnt/models/hf-cache}:/root/.cache/huggingface
       - ${MODELS_DIR:-/mnt/models}:/mnt/models:ro
       - ../tools:/tools:ro
-      - /tmp/nvidia-mps:/tmp/nvidia-mps    # MPS daemon pipe
     deploy:
       resources:
         reservations:
@@ -68,52 +60,37 @@ services:
       start_period: 240s
 
   # -------------------------------------------------------------------------
-  # Brain — SmolLM3-3B NVFP4 via TRT-LLM (FastAPI, separate process for MPS)
-  # Uses spark-single-gpu-dev image (has tensorrt_llm for NVFP4 engine)
-  # With MPS: gets 10-20% of GPU SMs (background, latency not critical)
+  # Brain — Gemini 2.0 Flash via OpenRouter (FastAPI proxy, no GPU needed)
+  # Thin HTTP proxy: gateway → brain → OpenRouter → brain → gateway
+  # Zero GPU load — all inference happens in the cloud
   # -------------------------------------------------------------------------
   brain:
-    image: nvcr.io/nvidia/tensorrt-llm/release:spark-single-gpu-dev
+    image: python:3.12-slim
     restart: unless-stopped
-    shm_size: '2gb'
-    ipc: host                    # required for MPS daemon communication
     dns:
       - 8.8.8.8
       - 8.8.4.4
     ports:
-      - "8015:8015"              # FastAPI HTTP
-    entrypoint: ["/bin/bash", "-c"]
+      - "8015:8015"
+    entrypoint: ["bash", "-c"]
     command:
       - |
-        pip install -q fastapi uvicorn 2>/dev/null
+        pip install -q fastapi uvicorn httpx 2>/dev/null
         python3 /scripts/server_brain.py
     environment:
-      BRAIN_ENGINE:      "${BRAIN_ENGINE:-/mnt/models/smollm3-3b-nvfp4-engine}"
-      BRAIN_MODEL:       "${BRAIN_MODEL:-/mnt/models/smollm3-3b}"
-      BRAIN_PORT:        "8015"
-      HF_TOKEN:          "${HF_TOKEN:-}"
-      HF_HUB_OFFLINE:    "1"
-      TRANSFORMERS_OFFLINE: "1"
-      # MPS: limit this container to 20% of GPU SMs
-      CUDA_MPS_ACTIVE_THREAD_PERCENTAGE: "${BRAIN_GPU_PERCENT:-20}"
+      OPENROUTER_API_KEY:  "${OPENROUTER_API_KEY}"
+      OPENROUTER_MODEL:    "${OPENROUTER_MODEL:-google/gemini-2.0-flash-001}"
+      BRAIN_PORT:          "8015"
+      BRAIN_MAX_TOKENS:    "${BRAIN_MAX_TOKENS:-200}"
+      BRAIN_TEMPERATURE:   "${BRAIN_TEMPERATURE:-0.7}"
     volumes:
-      - ${HF_CACHE_DIR:-/mnt/models/hf-cache}:/root/.cache/huggingface
-      - ${MODELS_DIR:-/mnt/models}:/mnt/models:ro
-      - /tmp/nvidia-mps:/tmp/nvidia-mps    # MPS daemon pipe
-      - ../scripts:/scripts:ro             # server_brain.py
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+      - ../scripts:/scripts:ro
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8015/health"]
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8015/health')"]
       interval: 15s
       timeout: 10s
-      retries: 12
-      start_period: 180s
+      retries: 5
+      start_period: 30s
 
   # -------------------------------------------------------------------------
   # C++ Gateway (WebSocket → Triton gRPC)
