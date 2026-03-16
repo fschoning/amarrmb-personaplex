@@ -68,6 +68,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.brain
+      network: host
     image: personaplex-brain:latest
     restart: unless-stopped
     dns:
