@@ -75,7 +75,7 @@ services:
     entrypoint: ["bash", "-c"]
     command:
       - |
-        pip install -q fastapi uvicorn httpx 2>/dev/null
+        pip install --break-system-packages -q fastapi uvicorn httpx && \
         python3 /scripts/server_brain.py
     environment:
       OPENROUTER_API_KEY:  "${OPENROUTER_API_KEY}"
