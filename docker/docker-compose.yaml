@@ -65,26 +65,22 @@ services:
   # Zero GPU load — all inference happens in the cloud
   # -------------------------------------------------------------------------
   brain:
-    image: python:3.12-slim
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.brain
+    image: personaplex-brain:latest
     restart: unless-stopped
     dns:
       - 8.8.8.8
       - 8.8.4.4
     ports:
       - "8015:8015"
-    entrypoint: ["bash", "-c"]
-    command:
-      - |
-        pip install --break-system-packages -q fastapi uvicorn httpx && \
-        python3 /scripts/server_brain.py
     environment:
       OPENROUTER_API_KEY:  "${OPENROUTER_API_KEY}"
       OPENROUTER_MODEL:    "${OPENROUTER_MODEL:-google/gemini-2.0-flash-001}"
       BRAIN_PORT:          "8015"
       BRAIN_MAX_TOKENS:    "${BRAIN_MAX_TOKENS:-200}"
       BRAIN_TEMPERATURE:   "${BRAIN_TEMPERATURE:-0.7}"
-    volumes:
-      - ../scripts:/scripts:ro
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8015/health')"]
       interval: 15s

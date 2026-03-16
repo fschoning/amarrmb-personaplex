@@ -1,0 +1,12 @@
+# docker/Dockerfile.brain
+# Lightweight brain proxy — forwards requests to OpenRouter
+FROM python:3.12-slim
+
+RUN pip install --no-cache-dir fastapi uvicorn httpx
+
+WORKDIR /app
+COPY scripts/server_brain.py /app/server_brain.py
+
+EXPOSE 8015
+
+CMD ["python3", "/app/server_brain.py"]
