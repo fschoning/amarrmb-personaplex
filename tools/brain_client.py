@@ -87,8 +87,8 @@ FRAME_MS    = 80
 FRAME_SAMPLES_IN  = INPUT_RATE  * FRAME_MS // 1000   # 1920
 FRAME_SAMPLES_OUT = OUTPUT_RATE * FRAME_MS // 1000   # 3840
 
-DETECTOR_MODEL   = "gemini-2.0-flash-exp"  # Live API
-COMPRESSOR_MODEL = "gemini-2.0-flash-001"  # REST API (stable)
+DETECTOR_MODEL   = "gemini-2.0-flash-live-001"  # Live API (bidiGenerateContent)
+COMPRESSOR_MODEL = "gemini-2.0-flash-001"        # REST API (stable)
 
 # Keepalive: prime standby every N seconds to prevent prompt amnesia (4-min window)
 KEEPALIVE_INTERVAL_S = 170   # 2 min 50 sec — safe margin before 4-min forgetfulness
@@ -392,7 +392,7 @@ class Detector:
 
         self._client = live_genai.Client(
             api_key=api_key,
-            http_options={"api_version": "v1alpha"},
+            http_options={"api_version": "v1beta"},
         )
 
         self._eval_event  = None   # asyncio.Event
