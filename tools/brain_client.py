@@ -3,22 +3,33 @@
 PersonaPlex v3 — Workstation Brain Client
 ==========================================
 Connects to the PersonaPlex gateway on the Spark.
-  Receives: AI audio (plays to speakers) + transcript text (feeds brain)
-  Sends:    Human mic audio + node commands (switch, prime, etc.)
+  Receives: AI audio (plays speakers) + transcript text + turn.boundary events
+  Sends:    Human mic audio + node commands
 
-Brain architecture uses Gemini Live API:
-  - ONE persistent WebSocket session to Gemini for the whole conversation
-  - Transcript deltas streamed in with turn_complete=False (no cost for eval)
-  - Periodic lightweight "evaluate" trigger (10 tokens) → streaming response
-  - Model holds all context internally — you only pay for NEW tokens
+Brain architecture:
+  Gemini 1 — DETECTOR  (google-genai Live API, persistent WebSocket)
+    - Receives transcript deltas silently (turn_complete=False)
+    - On every turn.boundary "human_end": evaluates with turn_complete=True
+    - Responds: CONTINUE or ACTION_NEEDED + reason/topic
+    - Reconnects every ~9 min injecting full transcript for continuity
 
-Cost model vs polling:
-  Polling:    5000 tokens in + 300 out every 8s  (expensive, grows with transcript)
-  Live:       50 tokens in continuously + 10-token eval trigger + 300 out on action
-              = ~90% cheaper for long sessions
+  Gemini 2 — COMPRESSOR  (google-generativeai Flash, REST, context caching)
+    - Called when brain decides ACTION_NEEDED or keepalive timer fires
+    - Reads full local transcript, produces 300-500 token boot payload
+    - Context caching: only pays for new transcript delta per call
+
+Node flow:
+  Keepalive (every 170s):
+    Compressor → boot_payload → node.refresh → standby primed
+    → node.standby_ready → node.switch(standby) → node.stop(filler) reset
+
+  ACTION_NEEDED:
+    node.switch(filler) immediately
+    Compressor → boot_payload → node.prime(standby)
+    → node.standby_ready → node.switch(standby) + node.stop(filler)
 
 Usage:
-  pip install websockets sounddevice numpy google-genai
+  pip install websockets sounddevice numpy google-genai google-generativeai
 
   export GOOGLE_API_KEY=AIza...
   python brain_client.py --host 192.168.2.117 --port 8998 \\
@@ -32,12 +43,14 @@ Usage:
 import argparse
 import asyncio
 import base64
+import datetime
 import json
 import os
 import queue
 import sys
 import threading
 import time
+from typing import Optional
 
 try:
     import websockets
@@ -56,12 +69,19 @@ except (ImportError, OSError):
     print("WARNING: sounddevice not available — mic/speaker mode disabled")
 
 try:
-    from google import genai as google_genai
-    from google.genai import types as genai_types
-    _GENAI = True
+    from google import genai as live_genai
+    from google.genai import types as live_types
+    _LIVE_GENAI = True
 except ImportError:
-    _GENAI = False
-    print("WARNING: pip install google-genai — brain will be disabled")
+    _LIVE_GENAI = False
+    print("WARNING: pip install google-genai — Detector disabled")
+
+try:
+    import google.generativeai as genai_rest
+    _REST_GENAI = True
+except ImportError:
+    _REST_GENAI = False
+    print("WARNING: pip install google-generativeai — Compressor disabled")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -69,20 +89,26 @@ except ImportError:
 INPUT_RATE  = 24000
 OUTPUT_RATE = 48000
 FRAME_MS    = 80
-FRAME_SAMPLES_IN  = INPUT_RATE  * FRAME_MS // 1000   # 1920 samples
-FRAME_SAMPLES_OUT = OUTPUT_RATE * FRAME_MS // 1000   # 3840 samples
+FRAME_SAMPLES_IN  = INPUT_RATE  * FRAME_MS // 1000   # 1920
+FRAME_SAMPLES_OUT = OUTPUT_RATE * FRAME_MS // 1000   # 3840
 
-GEMINI_LIVE_MODEL = "gemini-2.0-flash-exp"
+DETECTOR_MODEL   = "gemini-2.0-flash-exp"  # Live API
+COMPRESSOR_MODEL = "gemini-2.0-flash-001"  # REST API (stable)
 
-# How many NEW chars to accumulate before triggering an evaluation
-# (~30 words ≈ 150 chars. Trigger every ~150 new chars.)
-EVAL_TRIGGER_CHARS = 150
+# Keepalive: prime standby every N seconds to prevent prompt amnesia (4-min window)
+KEEPALIVE_INTERVAL_S = 170   # 2 min 50 sec — safe margin before 4-min forgetfulness
 
-# Minimum chars in transcript before first eval
+# Detector Live session max age before reconnect (Google cap ~10 min)
+LIVE_SESSION_MAX_S = 520      # ~8.5 min — reconnect proactively
+
+# Compressor context caching: refresh cache every N new chars of transcript
+CACHE_REFRESH_CHARS = 2000    # ~500 new tokens
+
+# Min transcript length before brain starts evaluating
 BRAIN_MIN_CHARS = 80
 
-# Live session max duration before reconnect (Google limit ~10 min)
-LIVE_SESSION_MAX_S = 540   # reconnect at 9 min proactively
+# Boot payload target size (characters) — must fit PP's ~1000 token window
+BOOT_PAYLOAD_MAX_CHARS = 3500
 
 VOICE_NAMES = [
     "NATF0","NATF1","NATF2","NATF3",
@@ -91,6 +117,69 @@ VOICE_NAMES = [
     "VARM0","VARM1","VARM2","VARM3","VARM4",
 ]
 VOICE_SENTINEL = -999
+
+# ---------------------------------------------------------------------------
+# Prompt templates
+# ---------------------------------------------------------------------------
+
+DETECTOR_SYSTEM = """\
+You are the brain for a voice AI agent.
+AI Persona: {persona}
+
+You receive the AI's transcript incrementally.
+When prompted to evaluate, respond with EXACTLY ONE of:
+
+CONTINUE
+  (the AI can handle the conversation with its current context)
+
+ACTION_NEEDED
+[REASON] <one sentence: why the AI cannot answer without new information>
+[TOPIC] <the specific question or knowledge gap>
+
+Critical rules:
+- Default is CONTINUE. Most turns should be CONTINUE.
+- Only say ACTION_NEEDED when the user asked something the AI genuinely
+  cannot know from the conversation so far (real-time data, specific facts
+  not established, tool calls needed).
+- PP currently knows: {current_pp_context}
+- Never add commentary or markdown. Exact format only.
+"""
+
+DETECTOR_EVAL_PROMPT = (
+    "Evaluate: can the AI handle the latest human turn with its current context? "
+    "CONTINUE or ACTION_NEEDED?"
+)
+
+COMPRESSOR_SYSTEM = """\
+You compress a full voice AI conversation transcript into a dense boot payload
+that will be loaded into the AI's memory before it speaks next.
+
+The AI has a 4-minute memory window, so EVERYTHING must be in the payload.
+If it's not in the payload, the AI won't remember it.
+
+Target: 300-500 tokens (~1500-2500 characters). Be concise but complete.
+
+AI Persona: {persona}
+
+Output ONLY this format (no markdown, no preamble):
+[PERSONA] {persona}
+[KEY_FACTS] <bullet list: all names, places, numbers, decisions mentioned>
+[TOPIC_HISTORY] <numbered list: topics in order, 1 sentence each>
+[CURRENT_TOPIC] <what is being discussed right now>
+[LAST_EXCHANGE] <what the human just asked/said and what the AI just said>
+[TONE] <emotional tone to match: warm/curious/professional/excited>
+[INSTRUCTION] <any specific instruction for the next response if relevant>
+"""
+
+COMPRESSOR_PROMPT = """\
+=== FULL CONVERSATION TRANSCRIPT ===
+{transcript}
+=== END TRANSCRIPT ===
+
+Additional context: {extra_context}
+
+Generate the boot payload now.
+"""
 
 # ---------------------------------------------------------------------------
 # Audio helpers
@@ -109,156 +198,211 @@ def encode_voice_tokens(voice_name: str) -> list:
     return [VOICE_SENTINEL] + [ord(c) for c in voice_name]
 
 # ---------------------------------------------------------------------------
-# Transcript accumulator
+# Transcript
 # ---------------------------------------------------------------------------
 
 class Transcript:
-    """Thread-safe rolling transcript with delta tracking for the Live brain."""
+    """Thread-safe rolling transcript with delta tracking."""
 
     def __init__(self):
-        self._lock = threading.Lock()
-        self._full = ""              # full text since session start
-        self._sent = 0              # chars already sent to Gemini Live session
-        self._session_start = ""    # summary at session reconnect point
+        self._lock       = threading.Lock()
+        self._full       = ""
+        self._sent       = 0    # chars sent to Detector since last reconnect
+        self._compressed = 0    # chars sent to Compressor cache
 
-    def append(self, delta: str):
+    def append(self, text: str):
         with self._lock:
-            self._full += delta
-            # Rolling window: keep last 100K chars
-            if len(self._full) > 100_000:
-                trim = len(self._full) - 80_000
-                self._full = self._full[trim:]
-                self._sent = max(0, self._sent - trim)
-
-    def unsent(self) -> str:
-        """Return text not yet sent to the Live session."""
-        with self._lock:
-            return self._full[self._sent:]
-
-    def mark_sent(self, n: int):
-        """Mark n additional chars as sent."""
-        with self._lock:
-            self._sent = min(self._sent + n, len(self._full))
-
-    def mark_all_sent(self):
-        with self._lock:
-            self._sent = len(self._full)
+            self._full += text
+            if len(self._full) > 200_000:
+                trim = len(self._full) - 150_000
+                self._full      = self._full[trim:]
+                self._sent      = max(0, self._sent - trim)
+                self._compressed = max(0, self._compressed - trim)
 
     def get(self) -> str:
         with self._lock:
             return self._full
 
-    def summary_prefix(self) -> str:
-        """Prefix to inject on reconnect."""
+    def unsent_for_detector(self) -> str:
         with self._lock:
-            return self._session_start
+            return self._full[self._sent:]
 
-    def set_summary_prefix(self, s: str):
+    def mark_sent_for_detector(self):
         with self._lock:
-            self._session_start = s
-            self._sent = 0  # reset — will re-send from beginning of new session
+            self._sent = len(self._full)
 
-    def clear(self):
+    def reset_detector_sent(self):
+        """Call on reconnect — will re-send from beginning."""
         with self._lock:
-            self._full = ""
             self._sent = 0
-            self._session_start = ""
+
+    def new_chars_for_compressor(self) -> int:
+        with self._lock:
+            return len(self._full) - self._compressed
+
+    def mark_compressed(self):
+        with self._lock:
+            self._compressed = len(self._full)
 
     def __len__(self):
         with self._lock:
             return len(self._full)
 
 # ---------------------------------------------------------------------------
-# Gemini Live Brain
+# Compressor — Gemini Flash REST with context caching
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT_TEMPLATE = """You are the brain behind a voice AI agent.
-AI Persona: {persona}
-
-You are listening to the transcript of what the AI has been saying in real-time.
-The transcript arrives incrementally.
-
-Your ONLY jobs are:
-1. Keep listening silently and accumulate context.
-2. When you observe that NEW EXTERNAL INFORMATION is needed to answer
-   a question or continue the conversation well, respond with:
-
-   ACTION_NEEDED
-   [REASON] <why new info is needed — 1 sentence>
-   [TOPIC] <the specific question or topic requiring new info>
-   [BOOT_PAYLOAD]
-   [SUMMARY] <what the conversation has been about>
-   [CONTEXT] <key facts the AI should know>
-   [LAST_TOPIC] <most recent topic being addressed>
-   [EMOTION] <tone: warm/curious/professional/excited>
-   [PERSONA] {persona}
-
-3. If nothing new is needed, respond with exactly: CONTINUE
-
-Rules:
-- Be decisive. If the AI is handling the conversation fine, say CONTINUE.
-- Only say ACTION_NEEDED when the user has asked something the AI cannot
-  answer without new information or a tool call.
-- Do not add commentary. Just CONTINUE or ACTION_NEEDED + structured block.
-"""
-
-EVAL_PROMPT = "Evaluate the transcript so far. Action needed? Respond with CONTINUE or ACTION_NEEDED."
-
-
-class GeminiLiveBrain:
+class Compressor:
     """
-    Maintains a persistent Gemini Live WebSocket session for the entire
-    conversation. Transcript deltas are fed continuously. Periodic evaluation
-    triggers ask the model to assess whether new information is needed.
+    Uses Gemini Flash REST API with context caching.
+    Called on keepalive and ACTION_NEEDED to generate boot payloads.
+    Cache is refreshed every ~CACHE_REFRESH_CHARS new transcript chars.
+    """
 
-    Architecture:
-      - One background asyncio task manages the Live session
-      - Transcript deltas arrive via queue and are sent with turn_complete=False
-      -_evaluate() sends the eval prompt with turn_complete=True
-      - Streaming response is parsed for CONTINUE / ACTION_NEEDED
+    def __init__(self, api_key: str, persona: str, model: str = COMPRESSOR_MODEL):
+        genai_rest.configure(api_key=api_key)
+        self._model_name = f"models/{model}"
+        self._persona    = persona
+        self._cache      = None
+        self._lock       = threading.Lock()
+        self._system     = COMPRESSOR_SYSTEM.format(persona=persona)
+
+        self._genai_model = genai_rest.GenerativeModel(
+            model_name=model,
+            system_instruction=self._system,
+        )
+        print(f"  [compressor] Gemini Flash ({model}) + context caching")
+
+    def compress(self, transcript: str, extra_context: str = "") -> str:
+        """
+        Generate a boot payload from the full transcript.
+        Uses cached context when transcript is large enough.
+        """
+        with self._lock:
+            # Refresh cache if transcript is large enough
+            if len(transcript) >= 4096:
+                self._refresh_cache(transcript)
+
+            if self._cache:
+                model = genai_rest.GenerativeModel.from_cached_content(self._cache)
+                prompt = (
+                    f"Additional context: {extra_context}\n"
+                    "Generate the boot payload now."
+                    if extra_context else
+                    "Generate the boot payload now."
+                )
+            else:
+                model = self._genai_model
+                prompt = COMPRESSOR_PROMPT.format(
+                    transcript=transcript[-8000:],
+                    extra_context=extra_context or "none",
+                )
+
+        try:
+            resp = model.generate_content(
+                prompt,
+                generation_config=genai_rest.GenerationConfig(
+                    max_output_tokens=600,
+                    temperature=0.2,
+                ),
+            )
+            result = resp.text.strip()
+            # Enforce max length for PP context window
+            if len(result) > BOOT_PAYLOAD_MAX_CHARS:
+                result = result[:BOOT_PAYLOAD_MAX_CHARS]
+            return result
+        except Exception as e:
+            print(f"\n  [compressor] ERROR: {e}")
+            return ""
+
+    def _refresh_cache(self, transcript: str):
+        """Upload transcript as cached content (called with lock held)."""
+        if self._cache:
+            try:
+                self._cache.delete()
+            except Exception:
+                pass
+            self._cache = None
+
+        try:
+            from google.generativeai import caching as genai_caching
+            contents = [
+                genai_rest.protos.Content(
+                    role="user",
+                    parts=[genai_rest.protos.Part(
+                        text=f"=== FULL TRANSCRIPT ===\n{transcript}\n=== END ===")]
+                )
+            ]
+            self._cache = genai_caching.CachedContent.create(
+                model=self._model_name,
+                display_name="pp_transcript",
+                system_instruction=self._system,
+                contents=contents,
+                ttl=datetime.timedelta(hours=1),
+            )
+            print(f"\n  [compressor] Cache refreshed ({len(transcript)} chars)")
+        except Exception as e:
+            print(f"\n  [compressor] Cache failed ({e}) — using direct call")
+            self._cache = None
+
+    def cleanup(self):
+        with self._lock:
+            if self._cache:
+                try:
+                    self._cache.delete()
+                except Exception:
+                    pass
+
+# ---------------------------------------------------------------------------
+# Detector — Gemini Live persistent session
+# ---------------------------------------------------------------------------
+
+class Detector:
+    """
+    Persistent Gemini Live WebSocket session.
+
+    Transcript deltas are fed silently (turn_complete=False).
+    On every turn.boundary "human_end" event: evaluates (turn_complete=True).
+    Reconnects at LIVE_SESSION_MAX_S, re-injecting the full transcript.
     """
 
     def __init__(self, api_key: str, persona: str,
-                 model: str = GEMINI_LIVE_MODEL,
+                 transcript: Transcript,
+                 model: str = DETECTOR_MODEL,
                  on_action=None):
-        self._api_key   = api_key
-        self._persona   = persona
-        self._model     = model
-        self._on_action = on_action   # async callback(boot_payload: str)
+        self._api_key    = api_key
+        self._persona    = persona
+        self._transcript = transcript
+        self._model      = model
+        self._on_action  = on_action   # async callback(reason, topic)
+        self._pp_context = f"Initial persona: {persona}"
 
-        self._system_prompt = SYSTEM_PROMPT_TEMPLATE.format(persona=persona)
-        self._client = google_genai.Client(
+        self._client = live_genai.Client(
             api_key=api_key,
             http_options={"api_version": "v1alpha"},
         )
-        self._config = genai_types.LiveConnectConfig(
-            response_modalities=["TEXT"],
-            system_instruction=genai_types.Content(
-                parts=[genai_types.Part(text=self._system_prompt)]
-            ),
-        )
 
-        # Communication with the live loop
-        self._delta_q: asyncio.Queue = None   # created in async context
-        self._eval_event: asyncio.Event = None
-        self._stop_event: asyncio.Event = None
-        self._session_task: asyncio.Task = None
+        self._eval_event  = None   # asyncio.Event
+        self._stop_event  = None
+        self._session_task = None
+        self._session_start = 0.0
+        self._eval_count  = 0
+        self._running     = False
 
-        self._session_start_t = 0.0
-        self._chars_since_eval = 0
-        self._evaluating = False
+        print(f"  [detector] Gemini Live ({model}) — eval on turn.boundary")
 
-        print(f"  [brain] Gemini Live session (model={model})")
-        print(f"  [brain] Eval trigger every ~{EVAL_TRIGGER_CHARS} new chars")
+    def update_pp_context(self, boot_payload: str):
+        """Called after each node.prime so Detector knows what PP knows."""
+        self._pp_context = boot_payload[:500] if boot_payload else self._pp_context
 
     async def start(self):
-        """Start the Live session manager. Call once from the async context."""
-        self._delta_q   = asyncio.Queue()
-        self._eval_event = asyncio.Event()
-        self._stop_event = asyncio.Event()
+        self._eval_event  = asyncio.Event()
+        self._stop_event  = asyncio.Event()
+        self._running     = True
         self._session_task = asyncio.create_task(self._session_loop())
 
     async def stop(self):
+        self._running = False
         if self._stop_event:
             self._stop_event.set()
         if self._session_task:
@@ -268,184 +412,146 @@ class GeminiLiveBrain:
             except asyncio.CancelledError:
                 pass
 
-    def feed_transcript(self, delta: str):
-        """
-        Called with each transcript.delta from the server.
-        Non-blocking — just enqueues for the live session.
-        """
-        if self._delta_q:
-            try:
-                self._delta_q.put_nowait(("transcript", delta))
-            except asyncio.QueueFull:
-                pass
-        self._chars_since_eval += len(delta)
-        # Auto-trigger eval when enough new text has arrived
-        if (self._chars_since_eval >= EVAL_TRIGGER_CHARS
-                and not self._evaluating
-                and self._eval_event):
+    def trigger_eval(self):
+        """Called when turn.boundary human_end received."""
+        if self._eval_event and self._running:
             self._eval_event.set()
 
-    def force_evaluate(self):
-        """Manually trigger an evaluation (keyboard command)."""
-        if self._eval_event:
-            self._eval_event.set()
+    def force_eval(self):
+        """Manual trigger from keyboard."""
+        self.trigger_eval()
+
+    @property
+    def status(self) -> dict:
+        age = time.monotonic() - self._session_start if self._session_start else 0
+        return {
+            "running":    self._running,
+            "session_age": f"{age:.0f}s",
+            "eval_count": self._eval_count,
+        }
+
+    # ── Internal ──────────────────────────────────────────────────────────
+
+    def _build_config(self) -> "live_types.LiveConnectConfig":
+        system = DETECTOR_SYSTEM.format(
+            persona=self._persona,
+            current_pp_context=self._pp_context[:300],
+        )
+        return live_types.LiveConnectConfig(
+            response_modalities=["TEXT"],
+            system_instruction=live_types.Content(
+                parts=[live_types.Part(text=system)]
+            ),
+        )
 
     async def _session_loop(self):
-        """
-        Main loop: manages the Live WebSocket connection, reconnects on
-        timeout/error, feeds a summary on reconnect.
-        """
-        summary = ""   # grows as sessions complete
-
-        while not self._stop_event.is_set():
+        """Reconnect loop — runs until stop() called."""
+        while self._running and not self._stop_event.is_set():
             try:
-                summary = await self._run_session(summary)
+                await self._run_one_session()
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                print(f"\n  [brain] Live session error: {e} — reconnecting in 3s...")
-                await asyncio.sleep(3)
+                if self._running:
+                    print(f"\n  [detector] Session error: {e} — reconnecting in 3s")
+                    await asyncio.sleep(3)
 
-    async def _run_session(self, prior_summary: str) -> str:
-        """
-        Open one Live session. Returns a summary string when the session
-        ends (for the next session to use as context).
-        """
-        self._session_start_t = time.monotonic()
-        self._chars_since_eval = 0
-        accumulated_response = ""
+    async def _run_one_session(self):
+        self._session_start = time.monotonic()
+        self._transcript.reset_detector_sent()
 
+        config = self._build_config()
         async with self._client.aio.live.connect(
-                model=self._model, config=self._config) as session:
+                model=self._model, config=config) as session:
 
-            print(f"\n  [brain] Live session connected.")
+            print("\n  [detector] Live session opened.")
 
-            # If reconnecting, inject the prior summary first
-            if prior_summary:
+            # Inject full transcript for context continuity on reconnect
+            full = self._transcript.get()
+            if full:
                 await session.send(
-                    input=f"[CONTEXT FROM PREVIOUS SESSION]\n{prior_summary}\n"
-                           "[END CONTEXT]\n",
+                    input=f"[TRANSCRIPT SO FAR]\n{full}\n[END]\n",
                     end_of_turn=False
                 )
-                print(f"  [brain] Injected prior session summary.")
+                self._transcript.mark_sent_for_detector()
+                print(f"  [detector] Injected {len(full)} chars of transcript.")
 
-            # Run sender and receiver concurrently
-            sender_task   = asyncio.create_task(
-                self._sender(session))
-            receiver_task = asyncio.create_task(
-                self._receiver(session))
+            sender   = asyncio.create_task(self._sender(session))
+            receiver = asyncio.create_task(self._receiver(session))
 
             try:
                 done, pending = await asyncio.wait(
-                    [sender_task, receiver_task],
+                    [sender, receiver],
                     return_when=asyncio.FIRST_COMPLETED,
                 )
-                for t in pending:
+            finally:
+                for t in [sender, receiver]:
                     t.cancel()
-            except Exception:
-                pass
-
-        # Generate a compact summary of this session for continuity
-        return await self._compact_summary(session)
+                    try: await t
+                    except asyncio.CancelledError: pass
 
     async def _sender(self, session):
-        """
-        Pull deltas from _delta_q and send with turn_complete=False.
-        When _eval_event fires, send the evaluation prompt with turn_complete=True.
-        Reconnect if session runs too long.
-        """
-        while True:
-            # Check if session should be renewed
-            if time.monotonic() - self._session_start_t > LIVE_SESSION_MAX_S:
-                print("\n  [brain] Session age limit — reconnecting for fresh context.")
-                return  # causes _run_session to end and restart
+        """Feed new transcript deltas and fire eval prompts."""
+        while self._running:
+            # Reconnect if session too old
+            if time.monotonic() - self._session_start > LIVE_SESSION_MAX_S:
+                print("\n  [detector] Session age limit — reconnecting.")
+                return
 
-            # Drain any pending transcript deltas
-            flushed = False
-            while not self._delta_q.empty():
-                kind, text = await self._delta_q.get()
-                if kind == "transcript":
-                    await session.send(input=text, end_of_turn=False)
-                    flushed = True
+            # Feed any unsent transcript delta
+            delta = self._transcript.unsent_for_detector()
+            if delta:
+                await session.send(input=delta, end_of_turn=False)
+                self._transcript.mark_sent_for_detector()
 
-            # Check if eval was triggered
+            # Fire eval if triggered
             if self._eval_event.is_set():
                 self._eval_event.clear()
-                self._chars_since_eval = 0
-                self._evaluating = True
-                print("\n  [brain] Evaluating...", end="", flush=True)
-                await session.send(input=EVAL_PROMPT, end_of_turn=True)
+                self._eval_count += 1
+                print(f"\n  [detector] Evaluating (#{self._eval_count})...", end="", flush=True)
+                await session.send(input=DETECTOR_EVAL_PROMPT, end_of_turn=True)
 
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.02)
 
     async def _receiver(self, session):
-        """
-        Receive streaming tokens from Gemini. Parse for CONTINUE / ACTION_NEEDED.
-        """
+        """Receive and parse Gemini's evaluation responses."""
         response_buf = ""
         async for chunk in session.receive():
-            if self._stop_event.is_set():
+            if not self._running:
                 break
-
-            text = getattr(chunk, "text", None)
+            text = getattr(chunk, "text", None) or ""
             if text:
                 response_buf += text
                 print(text, end="", flush=True)
 
-            # Check if the turn is complete
             sc = getattr(chunk, "server_content", None)
-            turn_done = sc and getattr(sc, "turn_complete", False)
-
-            if turn_done and response_buf.strip():
+            if sc and getattr(sc, "turn_complete", False):
                 await self._handle_response(response_buf.strip())
                 response_buf = ""
-                self._evaluating = False
-                print()  # newline after response
+                print()
 
-    async def _handle_response(self, response: str):
-        """Parse Gemini's evaluation response and take action."""
-        if response.startswith("CONTINUE"):
-            print("\n  [brain] ✓ CONTINUE — no action needed")
+    async def _handle_response(self, text: str):
+        if not text:
             return
-
-        if "ACTION_NEEDED" in response:
-            print("\n  [brain] ⚡ ACTION NEEDED")
-            # Extract the BOOT_PAYLOAD section
-            boot_start = response.find("[BOOT_PAYLOAD]")
-            if boot_start >= 0:
-                boot_payload = response[boot_start + len("[BOOT_PAYLOAD]"):].strip()
-            else:
-                boot_payload = response
-
+        if "CONTINUE" in text and "ACTION_NEEDED" not in text:
+            print(f"\n  [detector] ✓ CONTINUE")
+            return
+        if "ACTION_NEEDED" in text:
+            reason = ""
+            topic  = ""
+            for line in text.splitlines():
+                if line.startswith("[REASON]"):
+                    reason = line[8:].strip()
+                elif line.startswith("[TOPIC]"):
+                    topic = line[7:].strip()
+            print(f"\n  [detector] ⚡ ACTION_NEEDED — {reason}")
             if self._on_action:
-                await self._on_action(boot_payload)
+                await self._on_action(reason, topic)
         else:
-            # Unexpected response — log it
-            print(f"\n  [brain] Unexpected response: {response[:80]}")
-
-    async def _compact_summary(self, session) -> str:
-        """
-        At session end, ask Gemini for a compact summary to carry forward.
-        Uses a new one-shot call (not the Live session) to avoid state issues.
-        """
-        try:
-            model = google_genai.GenerativeModel(
-                model_name=self._model,
-            )
-            resp = model.generate_content(
-                (f"Summarize this conversation context in 200 words for handoff "
-                 f"to a new session. Focus on key topics, facts, and the last question."),
-                generation_config={"max_output_tokens": 250, "temperature": 0.1},
-            )
-            summary = resp.text.strip()
-            print(f"\n  [brain] Session summary: {summary[:80]}...")
-            return summary
-        except Exception as e:
-            print(f"\n  [brain] Compact summary failed: {e}")
-            return ""
+            print(f"\n  [detector] Unexpected: {text[:80]}")
 
 # ---------------------------------------------------------------------------
-# PersonaPlex v3 Client
+# PersonaPlexClient
 # ---------------------------------------------------------------------------
 
 class PersonaPlexClient:
@@ -459,40 +565,115 @@ class PersonaPlexClient:
                            "filler": False, "state": "hot_only"}
 
         self._audio_out_q: queue.Queue = queue.Queue(maxsize=200)
+        self._action_in_progress = False   # guard against double ACTION_NEEDED
+        self._last_switch_t      = time.monotonic()
 
-        # Brain (Gemini Live)
-        self.brain: GeminiLiveBrain = None
-        if not args.no_brain and _GENAI and args.google_api_key:
-            self.brain = GeminiLiveBrain(
+        # ── Compressor (REST) ─────────────────────────────────────────────
+        self.compressor: Optional[Compressor] = None
+        if not args.no_brain and _REST_GENAI and args.google_api_key:
+            self.compressor = Compressor(
                 api_key=args.google_api_key,
                 persona=args.persona,
-                model=args.model,
-                on_action=self._on_brain_action,
+                model=args.compressor_model,
+            )
+
+        # ── Detector (Live) ───────────────────────────────────────────────
+        self.detector: Optional[Detector] = None
+        if not args.no_brain and _LIVE_GENAI and args.google_api_key and self.compressor:
+            self.detector = Detector(
+                api_key=args.google_api_key,
+                persona=args.persona,
+                transcript=self.transcript,
+                model=args.detector_model,
+                on_action=self._on_action_needed,
             )
         elif not args.no_brain:
-            if not _GENAI:
-                print("  Brain: disabled — pip install google-genai")
-            else:
-                print("  Brain: disabled — set GOOGLE_API_KEY or --google-api-key")
+            missing = []
+            if not _LIVE_GENAI:    missing.append("pip install google-genai")
+            if not _REST_GENAI:    missing.append("pip install google-generativeai")
+            if not args.google_api_key: missing.append("--google-api-key / GOOGLE_API_KEY")
+            print(f"  Brain: disabled — {', '.join(missing)}")
         else:
             print("  Brain: disabled (--no-brain)")
 
-    # ── Brain action callback ─────────────────────────────────────────────
+    # ── Brain callbacks ───────────────────────────────────────────────────
 
-    async def _on_brain_action(self, boot_payload: str):
+    async def _on_action_needed(self, reason: str, topic: str):
         """
-        Called when Gemini decides ACTION_NEEDED.
-        1. Immediately switch to Filler (human hears "hold on...")
-        2. Prime Standby with the new boot payload
-        3. When standby is ready, switch from Filler → Standby
+        Detector says ACTION_NEEDED:
+        1. Switch to Filler immediately (human hears "hold on...")
+        2. Call Compressor in background to generate boot payload
+        3. Prime Standby with payload
+        4. On node.standby_ready → switch Standby in + reset Filler
         """
-        print("\n  [brain] ACTION: switching to filler + priming standby...")
+        if self._action_in_progress:
+            print("\n  [brain] ACTION_NEEDED ignored — one already in progress")
+            return
+        self._action_in_progress = True
 
-        # Step 1: Filler takes over immediately
+        print(f"\n  [ACTION] Reason: {reason}")
+        print(f"  [ACTION] Topic:  {topic}")
+
+        # Step 1: Filler immediately
         await self.send_node_switch("filler")
 
-        # Step 2: Prime standby with the boot payload from brain
-        await self.send_node_prime(boot_payload)
+        # Step 2+3: Compress and prime in background (don't block)
+        asyncio.create_task(self._compress_and_prime(
+            extra_context=f"User needs info about: {topic}. Reason: {reason}"
+        ))
+
+    async def _compress_and_prime(self, extra_context: str = ""):
+        """Background task: call Compressor then prime Standby."""
+        try:
+            t0 = time.monotonic()
+            payload = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.compressor.compress(
+                    self.transcript.get(), extra_context
+                )
+            )
+            elapsed = time.monotonic() - t0
+            print(f"\n  [compressor] {elapsed:.1f}s → {payload[:80]}...")
+
+            if payload:
+                self.transcript.mark_compressed()
+                if self.detector:
+                    self.detector.update_pp_context(payload)
+                await self.send_node_prime(payload)
+        except Exception as e:
+            print(f"\n  [compressor] compress_and_prime error: {e}")
+            self._action_in_progress = False
+
+    async def _keepalive_loop(self):
+        """Trigger a node refresh every KEEPALIVE_INTERVAL_S seconds."""
+        await asyncio.sleep(KEEPALIVE_INTERVAL_S)  # don't fire immediately
+        while True:
+            if self.compressor and self.ws and not self._action_in_progress:
+                print("\n  [keepalive] Refreshing PP context...")
+                asyncio.create_task(self._keepalive_refresh())
+            await asyncio.sleep(KEEPALIVE_INTERVAL_S)
+
+    async def _keepalive_refresh(self):
+        """Generate boot payload and send node.refresh."""
+        try:
+            t0 = time.monotonic()
+            payload = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.compressor.compress(self.transcript.get())
+            )
+            elapsed = time.monotonic() - t0
+            print(f"\n  [keepalive] {elapsed:.1f}s → {payload[:80]}...")
+            if payload:
+                self.transcript.mark_compressed()
+                if self.detector:
+                    self.detector.update_pp_context(payload)
+                await self._send({
+                    "type":   "node.refresh",
+                    "prompt": payload,
+                    "voice":  self.args.voice.upper() if self.args.voice else "",
+                })
+        except Exception as e:
+            print(f"\n  [keepalive] Error: {e}")
 
     # ── WebSocket helpers ─────────────────────────────────────────────────
 
@@ -506,7 +687,9 @@ class PersonaPlexClient:
 
     async def send_node_prime(self, prompt: str):
         print(f"\n  → node.prime: {prompt[:80]}...")
-        await self._send({"type": "node.prime", "target": "standby", "prompt": prompt})
+        await self._send({
+            "type": "node.prime", "target": "standby", "prompt": prompt
+        })
 
     async def send_node_stop(self, target: str = "filler"):
         print(f"\n  → node.stop target={target}")
@@ -531,10 +714,10 @@ class PersonaPlexClient:
 
         elif t == "session.ready":
             print("  session.ready ✓ — PP active, audio flowing...")
-            # Start the Gemini Live brain session now that PP is ready
-            if self.brain:
-                await self.brain.start()
-                print("  [brain] Live session starting...")
+            # Start brain systems now that PP is ready
+            if self.detector:
+                await self.detector.start()
+                print("  [detector] Started.")
 
         elif t == "response.audio.delta":
             b64 = ev.get("delta", "")
@@ -550,9 +733,13 @@ class PersonaPlexClient:
             if text:
                 self.transcript.append(text)
                 print(f"\r  AI: ...{self.transcript.get()[-70:]}", end="", flush=True)
-                # Feed to Gemini Live brain (non-blocking)
-                if self.brain and len(self.transcript) >= BRAIN_MIN_CHARS:
-                    self.brain.feed_transcript(text)
+
+        elif t == "turn.boundary":
+            speaker = ev.get("speaker", "")
+            if speaker == "human_end" and len(self.transcript) >= BRAIN_MIN_CHARS:
+                # Human stopped speaking — trigger Detector evaluation
+                if self.detector:
+                    self.detector.trigger_eval()
 
         elif t == "node.status":
             self.node_state = {k: ev.get(k) for k in
@@ -562,12 +749,12 @@ class PersonaPlexClient:
                   f"filler={s['filler']} state={s['state']}")
 
         elif t == "node.standby_ready":
-            print("\n  [node.standby_ready] — switching to standby...")
-            # If filler is active, this is the ACTION flow completing:
-            # filler was inserted, standby now primed → switch standby in
+            print("\n  [node.standby_ready] → switching standby in...")
             await self.send_node_switch("standby")
-            # Tell filler to reset (so it's fresh for next trigger)
+            self._last_switch_t = time.monotonic()
+            # Reset filler and action guard
             await self.send_node_stop("filler")
+            self._action_in_progress = False
 
         elif t in ("error", "session_error"):
             msg = ev.get("error", {}).get("message", ev.get("message", "?"))
@@ -592,11 +779,11 @@ class PersonaPlexClient:
                 except queue.Empty:
                     continue
                 await self._send({
-                    "type": "input_audio_buffer.append",
+                    "type":  "input_audio_buffer.append",
                     "audio": pcm16_to_b64(raw),
                 })
 
-    # ── Speaker output ────────────────────────────────────────────────────
+    # ── Speaker ───────────────────────────────────────────────────────────
 
     def _speaker_thread(self):
         if not sd:
@@ -625,10 +812,12 @@ class PersonaPlexClient:
     s        — switch to standby (if primed)
     f        — switch to filler (immediate)
     r        — reset filler
+    k        — force keepalive refresh now
+    e        — force Detector evaluation now
     p <text> — prime standby with custom prompt
-    e        — force brain evaluation now
     t        — print full transcript
     n        — print node status
+    d        — print Detector status
     q        — quit
 """)
         loop = asyncio.get_event_loop()
@@ -640,28 +829,27 @@ class PersonaPlexClient:
             line = line.strip()
             if not line:
                 continue
-            if line == "q":
-                if self.ws:
-                    await self.ws.close()
+            if   line == "q":
+                if self.ws: await self.ws.close()
                 break
-            elif line == "s":
-                await self.send_node_switch("standby")
-            elif line == "f":
-                await self.send_node_switch("filler")
-            elif line == "r":
-                await self.send_node_stop("filler")
+            elif line == "s": await self.send_node_switch("standby")
+            elif line == "f": await self.send_node_switch("filler")
+            elif line == "r": await self.send_node_stop("filler")
+            elif line == "k": asyncio.create_task(self._keepalive_refresh())
+            elif line == "e":
+                if self.detector: self.detector.force_eval()
+                else: print("  Detector not running.")
             elif line.startswith("p "):
                 await self.send_node_prime(line[2:].strip())
-            elif line == "e":
-                if self.brain:
-                    self.brain.force_evaluate()
-                    print("  [brain] Evaluation triggered.")
-                else:
-                    print("  Brain not running.")
             elif line == "t":
                 print(f"\n--- Transcript ---\n{self.transcript.get()}\n---")
             elif line == "n":
                 print(f"\n  Node state: {self.node_state}")
+            elif line == "d":
+                if self.detector:
+                    print(f"\n  Detector: {self.detector.status}")
+                else:
+                    print("  Detector not running.")
             else:
                 print(f"  Unknown: {line!r}")
 
@@ -683,7 +871,6 @@ class PersonaPlexClient:
     async def run(self):
         url = f"ws://{self.args.host}:{self.args.port}/v1/realtime"
         print(f"Connecting to {url} ...")
-
         threading.Thread(target=self._speaker_thread, daemon=True).start()
         self.loop = asyncio.get_event_loop()
 
@@ -698,6 +885,7 @@ class PersonaPlexClient:
                     self._receive_loop(),
                     self._mic_sender(),
                     self._command_loop(),
+                    self._keepalive_loop(),
                 )
         except websockets.exceptions.ConnectionRefusedError:
             print(f"\nERROR: Connection refused at {url}")
@@ -706,8 +894,10 @@ class PersonaPlexClient:
         except KeyboardInterrupt:
             print("\nInterrupted.")
         finally:
-            if self.brain:
-                await self.brain.stop()
+            if self.detector:
+                await self.detector.stop()
+            if self.compressor:
+                self.compressor.cleanup()
 
     async def _receive_loop(self):
         async for msg in self.ws:
@@ -756,19 +946,24 @@ def main():
                    help="Voice name e.g. NATF0, or blank for interactive")
     p.add_argument("--google-api-key",
                    default=os.environ.get("GOOGLE_API_KEY", ""),
-                   dest="google_api_key",
-                   help="Google AI API key (or set GOOGLE_API_KEY env var)")
-    p.add_argument("--model", default=GEMINI_LIVE_MODEL)
+                   dest="google_api_key")
+    p.add_argument("--detector-model",  default=DETECTOR_MODEL,
+                   dest="detector_model")
+    p.add_argument("--compressor-model", default=COMPRESSOR_MODEL,
+                   dest="compressor_model")
     p.add_argument("--no-brain", action="store_true")
     args = p.parse_args()
 
+    brain_status = "disabled" if args.no_brain else (
+        f"Detector={args.detector_model} + Compressor={args.compressor_model}"
+    )
     print(f"""
 PersonaPlex v3 Brain Client
-  Server  : {args.host}:{args.port}
-  Persona : {args.persona[:60]}
-  Filler  : {args.filler[:60]}
-  Brain   : {'disabled' if args.no_brain else
-             f'Gemini Live ({args.model}) — streaming, event-driven'}
+  Server     : {args.host}:{args.port}
+  Persona    : {args.persona[:60]}
+  Filler     : {args.filler[:60]}
+  Brain      : {brain_status}
+  Keepalive  : every {KEEPALIVE_INTERVAL_S}s (~{KEEPALIVE_INTERVAL_S//60}m {KEEPALIVE_INTERVAL_S%60}s)
 """)
 
     if not args.voice:

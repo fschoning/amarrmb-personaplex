@@ -78,6 +78,7 @@ enum class NodeRole { Active, Standby, Filler };
 // ---------------------------------------------------------------------------
 enum class OrchestratorState {
     HOT_ONLY,      // Only Active running
+    PRIMING,       // Standby being loaded (send_start in progress)
     STANDBY_READY, // Standby primed, waiting for node.switch command
     FILLER_ACTIVE, // Filler is active (Active paused), brain working
     SWITCHING,     // Switch in progress
@@ -114,6 +115,7 @@ private:
     void cmd_activate(NodeRole target);    // Manual (testing)
     void cmd_pause(NodeRole target);       // Manual (testing)
     void cmd_stop(NodeRole target);        // Reset filler after use
+    void cmd_refresh(const std::string& prompt, const std::string& voice); // Keepalive refresh
 
     // ── Helpers ───────────────────────────────────────────────────────────
     TritonSession* active_session();
@@ -121,6 +123,7 @@ private:
     void execute_switch_to_filler();
     void send_node_status();
     void send_transcript_delta(const std::string& text);
+    void send_turn_boundary(const std::string& speaker); // "human_end" | "ai_start"
 
     // ── State ─────────────────────────────────────────────────────────────
     const Config&               cfg_;
@@ -154,11 +157,22 @@ private:
     std::vector<Command>  cmd_queue_;
     std::mutex            cmd_mtx_;
 
+    // Background thread for standby priming (non-blocking)
+    std::thread priming_thread_;
+
     // Frame counter
     int frame_no_ = 0;
 
     // Persona
     std::string persona_;
+
+    // Turn boundary tracking
+    // ai_speaking_: true while Active PP is producing non-silence audio
+    bool ai_speaking_       = false;
+    // human_silence_frames_: how many consecutive silent input frames
+    int  human_silent_frames_ = 0;
+    // After N silent input frames we treat it as human turn end
+    static constexpr int kHumanSilenceEndFrames = 5;  // 5 × 80ms = 400ms
 };
 
 } // namespace pg

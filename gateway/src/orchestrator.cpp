@@ -144,6 +144,7 @@ void Orchestrator::run() {
     // ── Audio loop ─────────────────────────────────────────────────────────
     static const std::string resp_id = "resp-0";
     static const std::string item_id = "item-0";
+    static const int kHumanSilenceEndFrames = 10; // 500ms at 20ms/frame
 
     while (!sess_->should_close.load()) {
 
@@ -161,6 +162,8 @@ void Orchestrator::run() {
                 } else if (cmd.type == "node.prime") {
                     NodeRole r = (cmd.target == "standby") ? NodeRole::Standby : NodeRole::Filler;
                     cmd_prime(r, cmd.prompt, cmd.voice);
+                } else if (cmd.type == "node.refresh") {
+                    cmd_refresh(cmd.prompt, cmd.voice);
                 } else if (cmd.type == "node.activate") {
                     NodeRole r = (cmd.target == "standby") ? NodeRole::Standby
                                : (cmd.target == "filler")  ? NodeRole::Filler
@@ -193,6 +196,25 @@ void Orchestrator::run() {
         if (got < FRAME_SAMPLES_24K)
             std::fill(pcm_24k.begin() + got, pcm_24k.end(), 0.f);
 
+        // ── Turn boundary detection on INPUT audio (human speaking) ───────────
+        // We detect silence in the *input* (human mic) to know when human
+        // has finished speaking. Use a simple RMS threshold on pcm_24k.
+        {
+            float sum = 0.f;
+            for (float s : pcm_24k) sum += s * s;
+            float rms_in = std::sqrt(sum / static_cast<float>(pcm_24k.size()));
+            bool input_silent = rms_in < 0.008f;  // ~-42 dBFS threshold
+
+            if (input_silent) {
+                if (++human_silent_frames_ == kHumanSilenceEndFrames) {
+                    // Human just stopped speaking (debounced)
+                    send_turn_boundary("human_end");
+                }
+            } else {
+                human_silent_frames_ = 0;
+            }
+        }
+
         // ── Infer on Active session ────────────────────────────────────────
         FrameOutput out;
         bool ok = false;
@@ -220,9 +242,22 @@ void Orchestrator::run() {
             send_transcript_delta(out.text_decoded);
         }
 
+        // ── AI speaking boundary detection ────────────────────────────────────
+        if (!out.pcm_48k.empty()) {
+            float sum = 0.f;
+            for (float s : out.pcm_48k) sum += s * s;
+            bool is_loud = std::sqrt(sum / out.pcm_48k.size()) > 0.01f;
+            if (is_loud && !ai_speaking_) {
+                ai_speaking_ = true;
+                send_turn_boundary("ai_start");
+            } else if (!is_loud && ai_speaking_) {
+                ai_speaking_ = false;
+            }
+        }
+
         ++frame_no_;
 
-        // ── Silence detection for scheduled node.switch ───────────────────
+        // ── Silence detection for output ──────────────────────────────────────────
         if (state_.load() == OrchestratorState::STANDBY_READY) {
             bool silent = silence_.push_frame(out.pcm_48k);
             if (silent) {
@@ -401,17 +436,29 @@ void Orchestrator::cmd_prime(NodeRole target, const std::string& prompt, const s
     ts_standby_ = std::make_unique<TritonSession>(
         cfg_.triton_url, cfg_.pipeline_model, kCorridStandby, cfg_.model_version);
 
-    if (!ts_standby_->send_start(voice_bytes, text_tokens)) {
-        fprintf(stderr, "[orchestrator] Standby send_start failed.\n");
-        ts_standby_.reset();
-        send_(make_error("node_error", "Standby prime failed"));
-        return;
-    }
+    // Run send_start in a background thread so the audio loop is not blocked.
+    // When done, set state to STANDBY_READY and notify client.
+    state_.store(OrchestratorState::PRIMING);
+    if (priming_thread_.joinable()) priming_thread_.join();
 
-    // Notify client that standby is ready to switch
-    std::string status = "{\"type\":\"node.standby_ready\",\"target\":\"standby\"}";
-    send_(status);
-    fprintf(stderr, "[orchestrator] Standby READY.\n");
+    priming_thread_ = std::thread([this, voice_bytes = std::move(voice_bytes),
+                                   text_tokens = std::move(text_tokens)]() mutable {
+        auto* ts = ts_standby_.get();
+        if (!ts) return;
+        if (!ts->send_start(voice_bytes, text_tokens)) {
+            fprintf(stderr, "[orchestrator] Standby send_start failed.\n");
+            ts_standby_.reset();
+            send_(make_error("node_error", "Standby prime failed"));
+            state_.store(OrchestratorState::HOT_ONLY);
+            return;
+        }
+        // Standby is ready — update state and notify client
+        state_.store(OrchestratorState::STANDBY_READY);
+        send_("{\"type\":\"node.standby_ready\"}");
+        send_node_status();
+        fprintf(stderr, "[orchestrator] Standby READY.\n");
+    });
+    priming_thread_.detach();
 }
 
 // ---------------------------------------------------------------------------
@@ -433,6 +480,14 @@ void Orchestrator::cmd_pause(NodeRole target) {
             target == NodeRole::Active ? "active" : "filler");
     // In testing mode: pause is a no-op, the active PP keeps generating
     // Full pause support (stopping frame sending) is a future feature
+}
+
+// ---------------------------------------------------------------------------
+// cmd_refresh — keepalive: prime standby with new payload
+// ---------------------------------------------------------------------------
+void Orchestrator::cmd_refresh(const std::string& prompt, const std::string& voice) {
+    fprintf(stderr, "[orchestrator] node.refresh: priming standby (keepalive).\n");
+    cmd_prime(NodeRole::Standby, prompt, voice);
 }
 
 // ---------------------------------------------------------------------------
@@ -507,6 +562,7 @@ void Orchestrator::send_node_status() {
     std::string state_str;
     switch (state_.load()) {
         case OrchestratorState::HOT_ONLY:      state_str = "hot_only"; break;
+        case OrchestratorState::PRIMING:       state_str = "priming"; break;
         case OrchestratorState::STANDBY_READY: state_str = "standby_ready"; break;
         case OrchestratorState::FILLER_ACTIVE: state_str = "filler_active"; break;
         case OrchestratorState::SWITCHING:     state_str = "switching"; break;
@@ -528,6 +584,22 @@ void Orchestrator::send_transcript_delta(const std::string& text) {
     oss << "{\"type\":\"transcript.delta\",\"text\":" << json_str(text)
         << ",\"frame\":" << frame_no_ << "}";
     send_(oss.str());
+}
+
+// ---------------------------------------------------------------------------
+// send_turn_boundary — emit turn.boundary event to client
+// ---------------------------------------------------------------------------
+void Orchestrator::send_turn_boundary(const std::string& speaker) {
+    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    std::ostringstream oss;
+    oss << "{\"type\":\"turn.boundary\","
+        << "\"speaker\":" << json_str(speaker) << ","
+        << "\"frame\":" << frame_no_ << ","
+        << "\"ts_ms\":" << now_ms << "}";
+    send_(oss.str());
+    fprintf(stderr, "[orchestrator] turn.boundary speaker=%s frame=%d\n",
+            speaker.c_str(), frame_no_);
 }
 
 } // namespace pg
