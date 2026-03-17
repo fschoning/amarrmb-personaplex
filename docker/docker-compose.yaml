@@ -36,6 +36,7 @@ services:
       - ${HF_CACHE_DIR:-${HOME}/.cache/huggingface}:/root/.cache/huggingface
       - ${MODELS_DIR:-/mnt/models}:/mnt/models:ro
       - ../tools:/tools:ro
+      - ../model_repository:/models
     deploy:
       resources:
         reservations:
