@@ -367,6 +367,111 @@ class Compressor:
                     pass
 
 # ---------------------------------------------------------------------------
+# DetectorFlash — fallback REST detector (no Live API needed)
+# ---------------------------------------------------------------------------
+
+class DetectorFlash:
+    """
+    Fallback Detector using standard Gemini Flash REST API.
+    Called on every turn.boundary human_end event (no persistent WebSocket).
+    Uses a multi-turn chat session to accumulate context cheaply.
+    """
+
+    def __init__(self, api_key: str, persona: str,
+                 transcript: Transcript,
+                 model: str = COMPRESSOR_MODEL,
+                 on_action=None):
+        self._client     = live_genai.Client(api_key=api_key)
+        self._model      = model
+        self._persona    = persona
+        self._transcript = transcript
+        self._on_action  = on_action
+        self._pp_context = f"Initial persona: {persona}"
+        self._running    = False
+        self._eval_count = 0
+        self._eval_event = None
+        self._loop       = None
+        self._system     = DETECTOR_SYSTEM.format(
+            persona=persona,
+            current_pp_context=self._pp_context[:300],
+        )
+        # Chat history (maintained client-side for cheap context)
+        self._chat_contents = []
+        print(f"  [detector-flash] REST fallback ({model}) — eval on turn.boundary")
+
+    def update_pp_context(self, boot_payload: str):
+        self._pp_context = boot_payload[:500] if boot_payload else self._pp_context
+
+    async def start(self):
+        self._running    = True
+        self._eval_event = asyncio.Event()
+        self._loop       = asyncio.get_event_loop()
+        print("  [detector-flash] Started (REST mode — Gemini Live not available).")
+
+    async def stop(self):
+        self._running = False
+
+    def trigger_eval(self):
+        if self._eval_event and self._running:
+            self._eval_event.set()
+
+    def force_eval(self):
+        self.trigger_eval()
+
+    @property
+    def status(self) -> dict:
+        return {"running": self._running, "mode": "REST-flash",
+                "eval_count": self._eval_count}
+
+    async def run_eval(self):
+        """Trigger an eval now (called from trigger_eval loop)."""
+        while self._running:
+            await self._eval_event.wait()
+            self._eval_event.clear()
+            if not self._running:
+                break
+            self._eval_count += 1
+            print(f"\n  [detector-flash] Evaluating (#{self._eval_count})...", end="", flush=True)
+            try:
+                transcript = self._transcript.get()
+                # Append latest transcript snapshot to chat history
+                self._chat_contents.append({
+                    "role": "user",
+                    "parts": [{"text": f"[TRANSCRIPT UPDATE]\n{transcript[-3000:]}\n\n{DETECTOR_EVAL_PROMPT}"}]
+                })
+                resp = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self._client.models.generate_content(
+                        model=self._model,
+                        contents=self._chat_contents,
+                        config=live_types.GenerateContentConfig(
+                            system_instruction=self._system,
+                            max_output_tokens=100,
+                            temperature=0.1,
+                        ),
+                    )
+                )
+                text = (resp.text or "").strip()
+                print(f" {text[:60]}")
+                # Add model response to history for cheap context accumulation
+                self._chat_contents.append({"role": "model", "parts": [{"text": text}]})
+                # Compact if chat history grows large
+                if len(self._chat_contents) > 20:
+                    self._chat_contents = self._chat_contents[-10:]
+
+                if "ACTION_NEEDED" in text and self._on_action:
+                    reason, topic = "", ""
+                    for line in text.splitlines():
+                        if line.startswith("[REASON]"):
+                            reason = line[8:].strip()
+                        elif line.startswith("[TOPIC]"):
+                            topic = line[7:].strip()
+                    await self._on_action(reason, topic)
+
+            except Exception as e:
+                print(f"\n  [detector-flash] eval error: {e}")
+
+# ---------------------------------------------------------------------------
 # Detector — Gemini Live persistent session
 # ---------------------------------------------------------------------------
 
@@ -459,13 +564,24 @@ class Detector:
 
     async def _session_loop(self):
         """Reconnect loop — runs until stop() called."""
+        consecutive_failures = 0
         while self._running and not self._stop_event.is_set():
             try:
                 await self._run_one_session()
+                consecutive_failures = 0
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 if self._running:
+                    consecutive_failures += 1
+                    err = str(e)
+                    # 1008 = Policy Violation — Live API not available for this key
+                    if "1008" in err and consecutive_failures >= 2:
+                        print(f"\n  [detector] Live API unavailable (1008 Policy Violation).")
+                        print(f"  [detector] 📌 Your API key may not have Gemini Live access.")
+                        print(f"  [detector] Stopping Live detector. Use --no-brain or check AI Studio access.")
+                        self._running = False
+                        break
                     print(f"\n  [detector] Session error: {e} — reconnecting in 3s")
                     await asyncio.sleep(3)
 
@@ -590,16 +706,25 @@ class PersonaPlexClient:
                 model=args.compressor_model,
             )
 
-        # ── Detector (Live) ───────────────────────────────────────────────
-        self.detector: Optional[Detector] = None
+        # ── Detector: prefer Live, fall back to Flash REST via --no-live ──
+        self.detector = None
         if not args.no_brain and _LIVE_GENAI and args.google_api_key and self.compressor:
-            self.detector = Detector(
-                api_key=args.google_api_key,
-                persona=args.persona,
-                transcript=self.transcript,
-                model=args.detector_model,
-                on_action=self._on_action_needed,
-            )
+            if args.no_live:
+                self.detector = DetectorFlash(
+                    api_key=args.google_api_key,
+                    persona=args.persona,
+                    transcript=self.transcript,
+                    model=args.compressor_model,
+                    on_action=self._on_action_needed,
+                )
+            else:
+                self.detector = Detector(
+                    api_key=args.google_api_key,
+                    persona=args.persona,
+                    transcript=self.transcript,
+                    model=args.detector_model,
+                    on_action=self._on_action_needed,
+                )
         elif not args.no_brain:
             missing = []
             if not _LIVE_GENAI:         missing.append("pip install google-genai")
@@ -729,7 +854,10 @@ class PersonaPlexClient:
             # Start brain systems now that PP is ready
             if self.detector:
                 await self.detector.start()
-                print("  [detector] Started.")
+                print(f"  [detector] Started ({type(self.detector).__name__}).")
+                # DetectorFlash needs its eval loop running as a task
+                if isinstance(self.detector, DetectorFlash):
+                    asyncio.create_task(self.detector.run_eval())
 
         elif t == "response.audio.delta":
             b64 = ev.get("delta", "")
@@ -776,20 +904,50 @@ class PersonaPlexClient:
 
     async def _mic_sender(self):
         if not sd:
+            print("  [mic] sounddevice not available — no audio input")
             await asyncio.sleep(99999)
             return
         mic_q: queue.Queue = queue.Queue()
+        sent_frames = 0
+        loud_frames  = 0
 
         def callback(indata, frames, time_cb, status):
+            if status:
+                pass  # ignore overflow etc
             mic_q.put_nowait(bytes(indata))
 
-        with sd.RawInputStream(samplerate=INPUT_RATE, channels=1, dtype="int16",
-                                blocksize=FRAME_SAMPLES_IN, callback=callback):
+        device_kw = {}
+        if self.args.input_device is not None:
+            device_kw["device"] = self.args.input_device
+
+        try:
+            stream_ctx = sd.RawInputStream(
+                samplerate=INPUT_RATE, channels=1, dtype="int16",
+                blocksize=FRAME_SAMPLES_IN, callback=callback,
+                **device_kw)
+        except Exception as e:
+            print(f"  [mic] Failed to open input device: {e}")
+            print(f"  [mic] Try: python tools/brain_client.py --list-devices")
+            await asyncio.sleep(99999)
+            return
+
+        print(f"  [mic] Input open — talk into your mic (use headphones!).")
+        with stream_ctx:
             while True:
                 try:
                     raw = mic_q.get(timeout=0.2)
                 except queue.Empty:
                     continue
+                sent_frames += 1
+                # Level monitor every 5s (62 frames = ~5s)
+                arr = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+                if np.abs(arr).max() > 300:
+                    loud_frames += 1
+                if sent_frames % 62 == 0:
+                    level = "OK" if loud_frames > 5 else "SILENT (check mic / headset)"
+                    print(f"\r  [mic] level={level} ({loud_frames}/62 loud frames)      ",
+                          end="", flush=True)
+                    loud_frames = 0
                 await self._send({
                     "type":  "input_audio_buffer.append",
                     "audio": pcm16_to_b64(raw),
@@ -800,8 +958,12 @@ class PersonaPlexClient:
     def _speaker_thread(self):
         if not sd:
             return
+        device_kw = {}
+        if self.args.output_device is not None:
+            device_kw["device"] = self.args.output_device
         stream = sd.OutputStream(
-            samplerate=OUTPUT_RATE, channels=1, dtype="float32")
+            samplerate=OUTPUT_RATE, channels=1, dtype="float32",
+            **device_kw)
         stream.start()
         try:
             while True:
@@ -963,19 +1125,46 @@ def main():
                    dest="detector_model")
     p.add_argument("--compressor-model", default=COMPRESSOR_MODEL,
                    dest="compressor_model")
-    p.add_argument("--no-brain", action="store_true")
+    p.add_argument("--no-brain",  action="store_true")
+    p.add_argument("--no-live",   action="store_true",
+                   help="Use Flash REST detector instead of Gemini Live WebSocket")
+    p.add_argument("--input-device",  type=int, default=None, dest="input_device",
+                   help="Sounddevice input device index (see --list-devices)")
+    p.add_argument("--output-device", type=int, default=None, dest="output_device",
+                   help="Sounddevice output device index (see --list-devices)")
+    p.add_argument("--list-devices", action="store_true", dest="list_devices",
+                   help="Print audio devices and exit")
     args = p.parse_args()
 
+    if args.list_devices:
+        if sd:
+            print("\nAudio devices:")
+            print(sd.query_devices())
+            default_in  = sd.default.device[0]
+            default_out = sd.default.device[1]
+            print(f"\nDefault input : {default_in} — {sd.query_devices(default_in)['name']}")
+            print(f"Default output: {default_out} — {sd.query_devices(default_out)['name']}")
+        else:
+            print("sounddevice not available")
+        sys.exit(0)
+
+    detector_name = "disabled"
+    if not args.no_brain and args.google_api_key:
+        detector_name = ("Flash-REST (--no-live)" if args.no_live
+                         else f"Live ({args.detector_model})")
     brain_status = "disabled" if args.no_brain else (
-        f"Detector={args.detector_model} + Compressor={args.compressor_model}"
+        f"Detector={detector_name} + Compressor={args.compressor_model}"
     )
     print(f"""
 PersonaPlex v3 Brain Client
-  Server     : {args.host}:{args.port}
-  Persona    : {args.persona[:60]}
-  Filler     : {args.filler[:60]}
-  Brain      : {brain_status}
-  Keepalive  : every {KEEPALIVE_INTERVAL_S}s (~{KEEPALIVE_INTERVAL_S//60}m {KEEPALIVE_INTERVAL_S%60}s)
+  Server      : {args.host}:{args.port}
+  Persona     : {args.persona[:60]}
+  Filler      : {args.filler[:60]}
+  Brain       : {brain_status}
+  Keepalive   : every {KEEPALIVE_INTERVAL_S}s (~{KEEPALIVE_INTERVAL_S//60}m {KEEPALIVE_INTERVAL_S%60}s)
+  Input dev   : {args.input_device if args.input_device is not None else 'default'}
+  Output dev  : {args.output_device if args.output_device is not None else 'default'}
+  Tip         : Use headphones to prevent AI audio feedback loop!
 """)
 
     if not args.voice:
