@@ -72,16 +72,11 @@ try:
     from google import genai as live_genai
     from google.genai import types as live_types
     _LIVE_GENAI = True
+    _REST_GENAI  = True   # same package handles both Live and REST
 except ImportError:
     _LIVE_GENAI = False
-    print("WARNING: pip install google-genai — Detector disabled")
-
-try:
-    import google.generativeai as genai_rest
-    _REST_GENAI = True
-except ImportError:
-    _REST_GENAI = False
-    print("WARNING: pip install google-generativeai — Compressor disabled")
+    _REST_GENAI  = False
+    print("WARNING: pip install google-genai — Brain (Detector + Compressor) disabled")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -254,24 +249,20 @@ class Transcript:
 
 class Compressor:
     """
-    Uses Gemini Flash REST API with context caching.
+    Uses Gemini Flash via the google-genai REST API with context caching.
     Called on keepalive and ACTION_NEEDED to generate boot payloads.
     Cache is refreshed every ~CACHE_REFRESH_CHARS new transcript chars.
     """
 
     def __init__(self, api_key: str, persona: str, model: str = COMPRESSOR_MODEL):
-        genai_rest.configure(api_key=api_key)
-        self._model_name = f"models/{model}"
+        self._client     = live_genai.Client(api_key=api_key)
+        self._model      = model
         self._persona    = persona
-        self._cache      = None
+        self._cache      = None      # CachedContent name string
+        self._cache_name = None
         self._lock       = threading.Lock()
         self._system     = COMPRESSOR_SYSTEM.format(persona=persona)
-
-        self._genai_model = genai_rest.GenerativeModel(
-            model_name=model,
-            system_instruction=self._system,
-        )
-        print(f"  [compressor] Gemini Flash ({model}) + context caching")
+        print(f"  [compressor] Gemini Flash ({model}) + context caching (google-genai)")
 
     def compress(self, transcript: str, extra_context: str = "") -> str:
         """
@@ -279,77 +270,99 @@ class Compressor:
         Uses cached context when transcript is large enough.
         """
         with self._lock:
-            # Refresh cache if transcript is large enough
-            if len(transcript) >= 4096:
+            # Refresh cache if transcript is large enough for caching to pay off
+            if len(transcript) >= 4096 and self._cache_name is None:
                 self._refresh_cache(transcript)
+            elif len(transcript) >= 4096 and self._cache_name:
+                # We have a cache — it was created with old transcript snapshot.
+                # Use it as-is; new delta will be in the prompt.
+                pass
 
-            if self._cache:
-                model = genai_rest.GenerativeModel.from_cached_content(self._cache)
-                prompt = (
-                    f"Additional context: {extra_context}\n"
-                    "Generate the boot payload now."
-                    if extra_context else
-                    "Generate the boot payload now."
+            cache_name = self._cache_name
+
+        try:
+            if cache_name:
+                # Use cached transcript prefix; append new delta + instruction
+                new_delta = transcript[self._cache_snapshot_len:] if hasattr(self, '_cache_snapshot_len') else ""
+                prompt_parts = []
+                if new_delta:
+                    prompt_parts.append(f"[NEW TRANSCRIPT DELTA]\n{new_delta}\n[END DELTA]\n")
+                if extra_context:
+                    prompt_parts.append(f"Additional context: {extra_context}\n")
+                prompt_parts.append("Generate the boot payload now.")
+                prompt = "".join(prompt_parts)
+
+                resp = self._client.models.generate_content(
+                    model=self._model,
+                    contents=prompt,
+                    config=live_types.GenerateContentConfig(
+                        cached_content=cache_name,
+                        max_output_tokens=600,
+                        temperature=0.2,
+                    ),
                 )
             else:
-                model = self._genai_model
+                # No cache yet — direct call with full transcript
                 prompt = COMPRESSOR_PROMPT.format(
                     transcript=transcript[-8000:],
                     extra_context=extra_context or "none",
                 )
+                resp = self._client.models.generate_content(
+                    model=self._model,
+                    contents=prompt,
+                    config=live_types.GenerateContentConfig(
+                        system_instruction=self._system,
+                        max_output_tokens=600,
+                        temperature=0.2,
+                    ),
+                )
 
-        try:
-            resp = model.generate_content(
-                prompt,
-                generation_config=genai_rest.GenerationConfig(
-                    max_output_tokens=600,
-                    temperature=0.2,
-                ),
-            )
-            result = resp.text.strip()
-            # Enforce max length for PP context window
+            result = resp.text.strip() if resp.text else ""
             if len(result) > BOOT_PAYLOAD_MAX_CHARS:
                 result = result[:BOOT_PAYLOAD_MAX_CHARS]
             return result
+
         except Exception as e:
             print(f"\n  [compressor] ERROR: {e}")
             return ""
 
     def _refresh_cache(self, transcript: str):
         """Upload transcript as cached content (called with lock held)."""
-        if self._cache:
+        if self._cache_name:
             try:
-                self._cache.delete()
+                self._client.caches.delete(name=self._cache_name)
             except Exception:
                 pass
-            self._cache = None
+            self._cache_name = None
 
         try:
-            from google.generativeai import caching as genai_caching
-            contents = [
-                genai_rest.protos.Content(
-                    role="user",
-                    parts=[genai_rest.protos.Part(
-                        text=f"=== FULL TRANSCRIPT ===\n{transcript}\n=== END ===")]
-                )
-            ]
-            self._cache = genai_caching.CachedContent.create(
-                model=self._model_name,
-                display_name="pp_transcript",
-                system_instruction=self._system,
-                contents=contents,
-                ttl=datetime.timedelta(hours=1),
+            cache = self._client.caches.create(
+                model=self._model,
+                config=live_types.CreateCachedContentConfig(
+                    display_name="pp_transcript",
+                    system_instruction=self._system,
+                    contents=[f"=== FULL TRANSCRIPT ===\n{transcript}\n=== END ==="],
+                    ttl=datetime.timedelta(hours=1),
+                ),
             )
-            print(f"\n  [compressor] Cache refreshed ({len(transcript)} chars)")
+            self._cache_name = cache.name
+            self._cache_snapshot_len = len(transcript)
+            print(f"\n  [compressor] Cache created ({len(transcript)} chars)")
         except Exception as e:
             print(f"\n  [compressor] Cache failed ({e}) — using direct call")
-            self._cache = None
+            self._cache_name = None
+
+    def refresh_cache_if_needed(self, transcript: str):
+        """Call periodically to refresh cache with latest transcript."""
+        with self._lock:
+            if len(transcript) >= 4096:
+                self._refresh_cache(transcript)
 
     def cleanup(self):
         with self._lock:
-            if self._cache:
+            if self._cache_name:
                 try:
-                    self._cache.delete()
+                    self._client.caches.delete(name=self._cache_name)
                 except Exception:
                     pass
 
@@ -589,10 +602,9 @@ class PersonaPlexClient:
             )
         elif not args.no_brain:
             missing = []
-            if not _LIVE_GENAI:    missing.append("pip install google-genai")
-            if not _REST_GENAI:    missing.append("pip install google-generativeai")
-            if not args.google_api_key: missing.append("--google-api-key / GOOGLE_API_KEY")
-            print(f"  Brain: disabled — {', '.join(missing)}")
+            if not _LIVE_GENAI:         missing.append("pip install google-genai")
+            if not args.google_api_key: missing.append("--google-api-key / $env:GOOGLE_API_KEY")
+            print(f"  Brain: disabled \u2014 {', '.join(missing)}")
         else:
             print("  Brain: disabled (--no-brain)")
 
