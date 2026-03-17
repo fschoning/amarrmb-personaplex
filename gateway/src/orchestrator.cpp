@@ -131,15 +131,9 @@ void Orchestrator::run() {
     // Init Active PP
     init_active();
 
-    // Pre-prime Filler PP in background
-    std::thread filler_init_thread([this]() {
-        try {
-            init_filler(filler_prompt_);
-        } catch (const std::exception& e) {
-            fprintf(stderr, "[orchestrator] Filler init failed: %s\n", e.what());
-        }
-    });
-    filler_init_thread.detach();
+    // NOTE: Filler is NOT pre-initialised at startup.
+    // It will be loaded when the client sends node.prime(filler) or node.switch(filler).
+    // Pre-loading was found to cause GPU contention with the Active node.
 
     // ── Audio loop ─────────────────────────────────────────────────────────
     static const std::string resp_id = "resp-0";

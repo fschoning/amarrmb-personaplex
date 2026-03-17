@@ -367,111 +367,6 @@ class Compressor:
                     pass
 
 # ---------------------------------------------------------------------------
-# DetectorFlash — fallback REST detector (no Live API needed)
-# ---------------------------------------------------------------------------
-
-class DetectorFlash:
-    """
-    Fallback Detector using standard Gemini Flash REST API.
-    Called on every turn.boundary human_end event (no persistent WebSocket).
-    Uses a multi-turn chat session to accumulate context cheaply.
-    """
-
-    def __init__(self, api_key: str, persona: str,
-                 transcript: Transcript,
-                 model: str = COMPRESSOR_MODEL,
-                 on_action=None):
-        self._client     = live_genai.Client(api_key=api_key)
-        self._model      = model
-        self._persona    = persona
-        self._transcript = transcript
-        self._on_action  = on_action
-        self._pp_context = f"Initial persona: {persona}"
-        self._running    = False
-        self._eval_count = 0
-        self._eval_event = None
-        self._loop       = None
-        self._system     = DETECTOR_SYSTEM.format(
-            persona=persona,
-            current_pp_context=self._pp_context[:300],
-        )
-        # Chat history (maintained client-side for cheap context)
-        self._chat_contents = []
-        print(f"  [detector-flash] REST fallback ({model}) — eval on turn.boundary")
-
-    def update_pp_context(self, boot_payload: str):
-        self._pp_context = boot_payload[:500] if boot_payload else self._pp_context
-
-    async def start(self):
-        self._running    = True
-        self._eval_event = asyncio.Event()
-        self._loop       = asyncio.get_event_loop()
-        print("  [detector-flash] Started (REST mode — Gemini Live not available).")
-
-    async def stop(self):
-        self._running = False
-
-    def trigger_eval(self):
-        if self._eval_event and self._running:
-            self._eval_event.set()
-
-    def force_eval(self):
-        self.trigger_eval()
-
-    @property
-    def status(self) -> dict:
-        return {"running": self._running, "mode": "REST-flash",
-                "eval_count": self._eval_count}
-
-    async def run_eval(self):
-        """Trigger an eval now (called from trigger_eval loop)."""
-        while self._running:
-            await self._eval_event.wait()
-            self._eval_event.clear()
-            if not self._running:
-                break
-            self._eval_count += 1
-            print(f"\n  [detector-flash] Evaluating (#{self._eval_count})...", end="", flush=True)
-            try:
-                transcript = self._transcript.get()
-                # Append latest transcript snapshot to chat history
-                self._chat_contents.append({
-                    "role": "user",
-                    "parts": [{"text": f"[TRANSCRIPT UPDATE]\n{transcript[-3000:]}\n\n{DETECTOR_EVAL_PROMPT}"}]
-                })
-                resp = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: self._client.models.generate_content(
-                        model=self._model,
-                        contents=self._chat_contents,
-                        config=live_types.GenerateContentConfig(
-                            system_instruction=self._system,
-                            max_output_tokens=100,
-                            temperature=0.1,
-                        ),
-                    )
-                )
-                text = (resp.text or "").strip()
-                print(f" {text[:60]}")
-                # Add model response to history for cheap context accumulation
-                self._chat_contents.append({"role": "model", "parts": [{"text": text}]})
-                # Compact if chat history grows large
-                if len(self._chat_contents) > 20:
-                    self._chat_contents = self._chat_contents[-10:]
-
-                if "ACTION_NEEDED" in text and self._on_action:
-                    reason, topic = "", ""
-                    for line in text.splitlines():
-                        if line.startswith("[REASON]"):
-                            reason = line[8:].strip()
-                        elif line.startswith("[TOPIC]"):
-                            topic = line[7:].strip()
-                    await self._on_action(reason, topic)
-
-            except Exception as e:
-                print(f"\n  [detector-flash] eval error: {e}")
-
-# ---------------------------------------------------------------------------
 # Detector — Gemini Live persistent session
 # ---------------------------------------------------------------------------
 
@@ -706,25 +601,16 @@ class PersonaPlexClient:
                 model=args.compressor_model,
             )
 
-        # ── Detector: prefer Live, fall back to Flash REST via --no-live ──
+        # ── Detector: Gemini Live ─────────────────────────────────────────────
         self.detector = None
         if not args.no_brain and _LIVE_GENAI and args.google_api_key and self.compressor:
-            if args.no_live:
-                self.detector = DetectorFlash(
-                    api_key=args.google_api_key,
-                    persona=args.persona,
-                    transcript=self.transcript,
-                    model=args.compressor_model,
-                    on_action=self._on_action_needed,
-                )
-            else:
-                self.detector = Detector(
-                    api_key=args.google_api_key,
-                    persona=args.persona,
-                    transcript=self.transcript,
-                    model=args.detector_model,
-                    on_action=self._on_action_needed,
-                )
+            self.detector = Detector(
+                api_key=args.google_api_key,
+                persona=args.persona,
+                transcript=self.transcript,
+                model=args.detector_model,
+                on_action=self._on_action_needed,
+            )
         elif not args.no_brain:
             missing = []
             if not _LIVE_GENAI:         missing.append("pip install google-genai")
@@ -851,13 +737,9 @@ class PersonaPlexClient:
 
         elif t == "session.ready":
             print("  session.ready ✓ — PP active, audio flowing...")
-            # Start brain systems now that PP is ready
             if self.detector:
                 await self.detector.start()
-                print(f"  [detector] Started ({type(self.detector).__name__}).")
-                # DetectorFlash needs its eval loop running as a task
-                if isinstance(self.detector, DetectorFlash):
-                    asyncio.create_task(self.detector.run_eval())
+                print(f"  [detector] Started.")
 
         elif t == "response.audio.delta":
             b64 = ev.get("delta", "")
