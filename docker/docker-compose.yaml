@@ -58,6 +58,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.gateway
+      network: host   # FetchContent needs host DNS to clone uWebSockets from GitHub
     image: personaplex-gateway:latest
     restart: unless-stopped
     network_mode: host
