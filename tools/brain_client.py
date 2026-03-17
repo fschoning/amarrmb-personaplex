@@ -6,32 +6,36 @@ Connects to the PersonaPlex gateway on the Spark.
 Receives: AI audio (plays to speakers) + transcript text (feeds brain)
 Sends:    Human mic audio + node commands (switch, prime, etc.)
 
-The Brain runs here on the workstation and calls Gemini Flash via OpenRouter.
+The Brain runs here on the workstation using Google Gemini with context
+caching — the growing transcript is cached so we only pay for new tokens.
 
 Usage:
-  pip install websockets sounddevice numpy httpx
+  pip install websockets sounddevice numpy google-generativeai
 
   # Interactive conversation with brain:
   python brain_client.py --host 192.168.2.117 --port 8998 \\
       --persona "You are Jane, a curious AI who loves science." \\
       --filler "Hold on, let me check that for you." \\
-      --voice NATF0 \\
-      --openrouter-key sk-or-v1-...
+      --voice NATF0
+
+  # Set API key via env:
+  export GOOGLE_API_KEY=AIza...
+  python brain_client.py --host 192.168.2.117
 
   # Without brain (audio test only):
-  python brain_client.py --host 192.168.2.117 --port 8998 --no-brain
+  python brain_client.py --host 192.168.2.117 --no-brain
 """
 
 import argparse
 import asyncio
 import base64
+import datetime
 import json
 import os
 import queue
 import sys
 import threading
 import time
-from datetime import datetime
 
 try:
     import websockets
@@ -50,28 +54,35 @@ except (ImportError, OSError):
     print("WARNING: sounddevice not available — mic/speaker mode disabled")
 
 try:
-    import httpx
-    _HTTPX = True
+    import google.generativeai as genai
+    from google.generativeai import caching as genai_caching
+    _GENAI = True
 except ImportError:
-    _HTTPX = False
-    print("WARNING: pip install httpx — brain will be disabled")
+    _GENAI = False
+    print("WARNING: pip install google-generativeai — brain will be disabled")
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-INPUT_RATE   = 24000   # Server expects 24kHz PCM16
-OUTPUT_RATE  = 48000   # Server outputs 48kHz
+INPUT_RATE   = 24000
+OUTPUT_RATE  = 48000
 FRAME_MS     = 80
 FRAME_SAMPLES_IN  = INPUT_RATE  * FRAME_MS // 1000   # 1920
 FRAME_SAMPLES_OUT = OUTPUT_RATE * FRAME_MS // 1000   # 3840
 
-OPENROUTER_URL   = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODEL = "google/gemini-2.0-flash-001"
+GEMINI_MODEL = "gemini-2.0-flash-001"
 
-# Minimum transcript chars before querying brain
-BRAIN_MIN_CHARS  = 50
-# Query brain every N seconds (not every frame)
-BRAIN_INTERVAL_S = 8.0
+# Context caching:
+# - Gemini requires ≥1024 tokens to be cached
+# - We refresh cache every CACHE_REFRESH_CHARS new chars (~1 token ≈ 4 chars)
+# - Min cache TTL is 1 hour; we renew each refresh
+CACHE_MIN_CHARS    = 4096   # ~1024 tokens — minimum to enable caching
+CACHE_REFRESH_CHARS = 2000  # Refresh cache every ~500 new tokens
+CACHE_TTL_HOURS    = 1
+
+# Brain query throttle
+BRAIN_MIN_CHARS  = 100    # At least 100 chars of transcript before first query
+BRAIN_INTERVAL_S = 10.0   # Don't query faster than this
 
 VOICE_NAMES = [
     "NATF0","NATF1","NATF2","NATF3",
@@ -91,87 +102,195 @@ def pcm16_to_b64(raw: bytes) -> str:
 def b64_to_pcm16(b64: str) -> bytes:
     return base64.b64decode(b64)
 
-def float32_to_pcm16(arr) -> bytes:
-    return np.clip(arr, -1., 1.).multiply(32767).astype(np.int16).tobytes() \
-        if False else (np.clip(arr, -1., 1.) * 32767).astype(np.int16).tobytes()
-
 def pcm16_to_float32(data: bytes):
     return np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
 
 def encode_voice_tokens(voice_name: str) -> list:
-    """Encode voice name as sentinel + ASCII ints for PP prompt injection."""
     return [VOICE_SENTINEL] + [ord(c) for c in voice_name]
-
-# ---------------------------------------------------------------------------
-# Brain (Gemini Flash via OpenRouter)
-# ---------------------------------------------------------------------------
-
-class Brain:
-    """Calls Gemini Flash via OpenRouter to analyse the transcript and decide node actions."""
-
-    def __init__(self, api_key: str, model: str = OPENROUTER_MODEL):
-        self.api_key = api_key
-        self.model   = model
-        self._client = httpx.Client(timeout=30.0)
-
-    def query(self, system: str, user: str, max_tokens: int = 300) -> str:
-        """Synchronous query — run in a thread."""
-        resp = self._client.post(
-            OPENROUTER_URL,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://github.com/personaplex",
-            },
-            json={
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user",   "content": user},
-                ],
-                "max_tokens":   max_tokens,
-                "temperature":  0.3,
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"].strip()
-
-    def close(self):
-        self._client.close()
-
 
 # ---------------------------------------------------------------------------
 # Transcript accumulator
 # ---------------------------------------------------------------------------
 
 class Transcript:
+    """Thread-safe rolling transcript buffer with delta tracking."""
+
     def __init__(self):
-        self._lock = threading.Lock()
-        self._text = ""
+        self._lock  = threading.Lock()
+        self._text  = ""
+        # Track how many chars were in the last cache upload
+        self._cached_len = 0
 
     def append(self, delta: str):
         with self._lock:
             self._text += delta
-            # Keep last 50K chars
-            if len(self._text) > 50000:
-                self._text = self._text[-40000:]
+            if len(self._text) > 100_000:
+                # Trim oldest — but keep _cached_len valid
+                trim = len(self._text) - 80_000
+                self._text = self._text[trim:]
+                self._cached_len = max(0, self._cached_len - trim)
 
     def get(self) -> str:
         with self._lock:
             return self._text
 
+    def new_chars_since_cache(self) -> int:
+        with self._lock:
+            return len(self._text) - self._cached_len
+
+    def mark_cached(self):
+        with self._lock:
+            self._cached_len = len(self._text)
+
     def clear(self):
         with self._lock:
             self._text = ""
+            self._cached_len = 0
 
     def __len__(self):
         with self._lock:
             return len(self._text)
 
+# ---------------------------------------------------------------------------
+# Brain — Google Gemini with context caching
+# ---------------------------------------------------------------------------
+
+class Brain:
+    """
+    Calls Gemini Flash using Google's native API with context caching.
+
+    Strategy:
+      - The SYSTEM INSTRUCTION (persona + format rules) is always cached.
+      - The growing TRANSCRIPT is uploaded as cached content and refreshed
+        every CACHE_REFRESH_CHARS new characters.
+      - Each brain query only sends the small "delta" prompt (new content
+        since last cache), keeping per-query token costs minimal.
+    
+    Token cost model:
+      Full price:  new transcript delta + query instruction (~50-100 tokens)
+      Cache price: cached system + transcript (~25% normal rate)
+    """
+
+    def __init__(self, api_key: str, model: str = GEMINI_MODEL, persona: str = ""):
+        genai.configure(api_key=api_key)
+        self.model_name = f"models/{model}"
+        self.persona    = persona
+        self._cache     = None      # CachedContent object
+        self._cache_transcript_len = 0  # chars in cache at last refresh
+        self._lock      = threading.Lock()
+
+        self._system_instruction = self._build_system_instruction()
+        print(f"  [brain] Using model: {model}")
+        print(f"  [brain] Context caching: enabled (min {CACHE_MIN_CHARS} chars = ~1K tokens)")
+
+    def _build_system_instruction(self) -> str:
+        return f"""You are the brain behind a voice AI agent.
+AI Persona: {self.persona}
+
+Your job: analyse the transcript of what the AI has been saying, then write
+a BOOT_PAYLOAD for the next AI node so the conversation continues seamlessly.
+
+Rules:
+- Respond ONLY with the structure below, no markdown, no preamble.
+- Be concise — each field max 2 sentences.
+
+[SUMMARY] <what the conversation has been about>
+[CONTEXT] <key facts, names, topics the AI should know>
+[LAST_TOPIC] <the most recent topic or question being addressed>
+[EMOTION] <tone to match: e.g. warm, curious, professional, excited>
+[PERSONA] {self.persona}"""
+
+    def _create_or_refresh_cache(self, transcript: str):
+        """Upload the full transcript as cached content. Called when cache is
+        stale or doesn't exist. Thread must hold self._lock."""
+        # Build the cached content — transcript as a 'user' turn
+        contents = [
+            genai.protos.Content(
+                role="user",
+                parts=[genai.protos.Part(text=f"=== FULL TRANSCRIPT ===\n{transcript}\n=== END ===")]
+            )
+        ]
+
+        # Delete old cache if exists
+        if self._cache:
+            try:
+                self._cache.delete()
+            except Exception:
+                pass
+            self._cache = None
+
+        try:
+            self._cache = genai_caching.CachedContent.create(
+                model=self.model_name,
+                display_name="personaplex_transcript",
+                system_instruction=self._system_instruction,
+                contents=contents,
+                ttl=datetime.timedelta(hours=CACHE_TTL_HOURS),
+            )
+            self._cache_transcript_len = len(transcript)
+            print(f"\n  [brain] Cache created/refreshed "
+                  f"({len(transcript)} chars ≈ {len(transcript)//4} tokens)")
+        except Exception as e:
+            # Caching failed (e.g. transcript too short) — fall back to no-cache
+            print(f"\n  [brain] Cache create failed ({e}) — using direct call")
+            self._cache = None
+
+    def query(self, transcript: str, delta_chars: int) -> str:
+        """
+        Query Gemini. Uses cached context when transcript is large enough.
+        delta_chars: how many chars are new since the last cache refresh.
+        """
+        with self._lock:
+            use_cache = (
+                len(transcript) >= CACHE_MIN_CHARS
+                and delta_chars >= CACHE_REFRESH_CHARS
+            )
+
+            if use_cache:
+                # Refresh cache with full transcript
+                self._create_or_refresh_cache(transcript)
+
+            if self._cache:
+                # Query using cached context — only send the instruction
+                model = genai.GenerativeModel.from_cached_content(self._cache)
+                query_text = (
+                    "Based on the cached transcript above, write the BOOT_PAYLOAD "
+                    "for the next AI node. Follow the format exactly."
+                )
+            else:
+                # No cache (transcript too short or caching unavailable)
+                model = genai.GenerativeModel(
+                    model_name=self.model_name,
+                    system_instruction=self._system_instruction,
+                )
+                # Include full transcript in the prompt
+                recent = transcript[-4000:] if len(transcript) > 4000 else transcript
+                query_text = (
+                    f"=== TRANSCRIPT ===\n{recent}\n=== END ===\n\n"
+                    "Write the BOOT_PAYLOAD for the next AI node."
+                )
+
+        response = model.generate_content(
+            query_text,
+            generation_config=genai.GenerationConfig(
+                max_output_tokens=300,
+                temperature=0.3,
+            ),
+        )
+        return response.text.strip()
+
+    def cleanup(self):
+        """Delete cached content on shutdown."""
+        with self._lock:
+            if self._cache:
+                try:
+                    self._cache.delete()
+                    print("  [brain] Cache deleted.")
+                except Exception:
+                    pass
 
 # ---------------------------------------------------------------------------
-# PersonaPlex v3 Brain Client
+# PersonaPlex v3 Client
 # ---------------------------------------------------------------------------
 
 class PersonaPlexClient:
@@ -181,93 +300,76 @@ class PersonaPlexClient:
         self.ws         = None
         self.loop       = None
         self.transcript = Transcript()
-        self.node_state = {"active": True, "standby": False, "filler": False, "state": "hot_only"}
+        self.node_state = {"active": True, "standby": False,
+                           "filler": False, "state": "hot_only"}
 
-        # Output audio queue (filled by WebSocket receiver, drained by sounddevice)
-        self._audio_out_q: queue.Queue = queue.Queue(maxsize=100)
+        self._audio_out_q: queue.Queue = queue.Queue(maxsize=200)
 
         # Brain
         self.brain = None
-        if args.openrouter_key and _HTTPX and not args.no_brain:
-            self.brain = Brain(args.openrouter_key, args.model)
-            print(f"  Brain: Gemini Flash ({args.model})")
+        if not args.no_brain and _GENAI and args.google_api_key:
+            self.brain = Brain(
+                api_key=args.google_api_key,
+                model=args.model,
+                persona=args.persona,
+            )
+        elif not args.no_brain:
+            if not _GENAI:
+                print("  Brain: disabled — pip install google-generativeai")
+            else:
+                print("  Brain: disabled — set GOOGLE_API_KEY or --google-api-key")
         else:
-            print("  Brain: disabled (--no-brain or missing --openrouter-key)")
+            print("  Brain: disabled (--no-brain)")
 
         self._brain_lock      = threading.Lock()
         self._brain_in_flight = False
         self._last_brain_t    = 0.0
-        self._standby_primed  = False
 
-    # ── WebSocket send helpers ─────────────────────────────────────────────
+    # ── WebSocket helpers ─────────────────────────────────────────────────
 
     async def _send(self, msg: dict):
         if self.ws:
             await self.ws.send(json.dumps(msg))
 
     async def send_node_switch(self, to: str):
-        """Switch to 'standby' or 'filler'."""
-        print(f"  → node.switch to={to}")
+        print(f"\n  → node.switch to={to}")
         await self._send({"type": "node.switch", "to": to})
 
-    async def send_node_prime(self, prompt: str, voice: str = ""):
-        """Prime the standby node with new context."""
-        print(f"  → node.prime standby: {prompt[:60]}...")
-        msg = {"type": "node.prime", "target": "standby", "prompt": prompt}
-        if voice:
-            msg["voice"] = voice
-        await self._send(msg)
-        self._standby_primed = False  # will be set when node.standby_ready arrives
+    async def send_node_prime(self, prompt: str):
+        print(f"\n  → node.prime: {prompt[:80]}...")
+        await self._send({"type": "node.prime", "target": "standby", "prompt": prompt})
 
     async def send_node_stop(self, target: str = "filler"):
-        print(f"  → node.stop target={target}")
+        print(f"\n  → node.stop target={target}")
         await self._send({"type": "node.stop", "target": target})
 
-    # ── Brain decision loop ────────────────────────────────────────────────
+    # ── Brain worker ──────────────────────────────────────────────────────
 
-    def _brain_worker(self, transcript_snapshot: str):
-        """Run in a thread. Queries Gemini and primes standby."""
+    def _brain_worker(self, transcript_snapshot: str, delta_chars: int):
+        """Run in thread. Queries Gemini (with caching) and primes standby."""
         try:
-            system_prompt = f"""You are the brain for a voice AI agent.
-Your persona: {self.args.persona}
-
-Analyse the transcript below (what the AI has been saying) and produce a
-BOOT_PAYLOAD to load into the next AI node so conversation continues naturally.
-
-Respond ONLY with this exact structure (no markdown, no code blocks):
-[SUMMARY] <one sentence: what was being discussed>
-[CONTEXT] <key facts/topics the AI should have ready>
-[LAST_TOPIC] <the most recent topic or question>
-[EMOTION] <tone to match: warm/curious/professional/excited>
-[PERSONA] {self.args.persona}"""
-
-            user_prompt = f"""=== TRANSCRIPT (AI speech so far) ===
-{transcript_snapshot[-3000:]}
-=== END TRANSCRIPT ===
-
-Write the BOOT_PAYLOAD for the next AI node."""
-
             t0 = time.monotonic()
-            response = self.brain.query(system_prompt, user_prompt, max_tokens=250)
-            elapsed = time.monotonic() - t0
+            response = self.brain.query(transcript_snapshot, delta_chars)
+            elapsed  = time.monotonic() - t0
 
-            print(f"\n[brain] {elapsed:.1f}s → {response[:120]}...")
+            # Mark transcript as cached up to this point
+            self.transcript.mark_cached()
 
-            # Fire node.prime over the event loop
+            cached_flag = "📦 cached" if len(transcript_snapshot) >= CACHE_MIN_CHARS else "📝 direct"
+            print(f"\n  [brain] {elapsed:.1f}s {cached_flag} → {response[:100]}...")
+
             if self.loop and response:
                 asyncio.run_coroutine_threadsafe(
-                    self.send_node_prime(response, self.args.voice or ""),
-                    self.loop
+                    self.send_node_prime(response), self.loop
                 )
 
         except Exception as e:
-            print(f"[brain] ERROR: {e}")
+            print(f"\n  [brain] ERROR: {e}")
         finally:
             with self._brain_lock:
                 self._brain_in_flight = False
 
     def _maybe_query_brain(self):
-        """Called from the receive loop. Fires brain query if conditions met."""
         if not self.brain:
             return
         now = time.monotonic()
@@ -279,32 +381,36 @@ Write the BOOT_PAYLOAD for the next AI node."""
             if self._brain_in_flight:
                 return
             self._brain_in_flight = True
+
         self._last_brain_t = now
-        t = threading.Thread(
+        snapshot    = self.transcript.get()
+        delta_chars = self.transcript.new_chars_since_cache()
+
+        threading.Thread(
             target=self._brain_worker,
-            args=(self.transcript.get(),),
-            daemon=True
-        )
-        t.start()
+            args=(snapshot, delta_chars),
+            daemon=True,
+        ).start()
 
-    # ── WebSocket message handler ──────────────────────────────────────────
+    # ── Message handler ───────────────────────────────────────────────────
 
-    async def _on_message(self, msg: str):
+    async def _on_message(self, raw: str):
         try:
-            ev = json.loads(msg)
+            ev = json.loads(raw)
         except Exception:
             return
 
         t = ev.get("type", "")
 
         if t == "session.created":
-            print(f"  session.created  id={ev.get('session',{}).get('id','?')}")
+            sid = ev.get("session", {}).get("id", ev.get("id", "?"))
+            print(f"  session.created  id={sid}")
 
         elif t == "session.updated":
-            print(f"  session.updated")
+            print("  session.updated")
 
         elif t == "session.ready":
-            print(f"  session.ready — PP nodes loaded, sending audio...")
+            print("  session.ready ✓  —  PP nodes loaded, audio flowing...")
 
         elif t == "response.audio.delta":
             b64 = ev.get("delta", "")
@@ -313,73 +419,59 @@ Write the BOOT_PAYLOAD for the next AI node."""
                 try:
                     self._audio_out_q.put_nowait(pcm)
                 except queue.Full:
-                    pass  # drop if buffer full (prevents stall)
+                    pass
 
         elif t == "transcript.delta":
             text = ev.get("text", "")
             if text:
                 self.transcript.append(text)
-                print(f"\r  AI: {self.transcript.get()[-60:]}", end="", flush=True)
+                print(f"\r  AI: ...{self.transcript.get()[-70:]}", end="", flush=True)
                 self._maybe_query_brain()
 
         elif t == "node.status":
-            self.node_state = {
-                "active":  ev.get("active",  False),
-                "standby": ev.get("standby", False),
-                "filler":  ev.get("filler",  False),
-                "state":   ev.get("state",   ""),
-            }
+            self.node_state = {k: ev.get(k) for k in
+                               ("active", "standby", "filler", "state")}
             s = self.node_state
             print(f"\n  [node.status] active={s['active']} standby={s['standby']} "
                   f"filler={s['filler']} state={s['state']}")
 
         elif t == "node.standby_ready":
-            print(f"\n  [node.standby_ready] — switching to standby...")
-            self._standby_primed = True
-            # Auto-switch to standby at silence
+            print("\n  [node.standby_ready] — issuing node.switch to standby...")
             await self.send_node_switch("standby")
 
-        elif t == "session_error" or t == "error":
-            print(f"\n  ERROR: [{ev.get('type','?')}] {ev.get('error',{}).get('message','')}")
+        elif t in ("error", "session_error"):
+            msg = ev.get("error", {}).get("message", ev.get("message", "?"))
+            print(f"\n  [ERROR] {msg}")
 
-        else:
-            # Ignore unknown events silently
-            pass
-
-    # ── Mic input loop ─────────────────────────────────────────────────────
+    # ── Mic sender ────────────────────────────────────────────────────────
 
     async def _mic_sender(self):
-        """Read mic frames and send to server every 80ms."""
         if not sd:
-            print("  No sounddevice — mic input disabled.")
             await asyncio.sleep(99999)
             return
 
         mic_q: queue.Queue = queue.Queue()
 
-        def mic_callback(indata, frames, time_info, status):
+        def callback(indata, frames, time_cb, status):
             mic_q.put_nowait(bytes(indata))
 
-        with sd.RawInputStream(
-            samplerate=INPUT_RATE, channels=1, dtype="int16",
-            blocksize=FRAME_SAMPLES_IN,
-            callback=mic_callback
-        ):
+        with sd.RawInputStream(samplerate=INPUT_RATE, channels=1, dtype="int16",
+                                blocksize=FRAME_SAMPLES_IN, callback=callback):
             while True:
                 try:
                     raw = mic_q.get(timeout=0.2)
                 except queue.Empty:
                     continue
-                b64 = pcm16_to_b64(raw)
-                await self._send({"type": "input_audio_buffer.append", "audio": b64})
+                await self._send({
+                    "type":  "input_audio_buffer.append",
+                    "audio": pcm16_to_b64(raw),
+                })
 
-    # ── Speaker output loop ────────────────────────────────────────────────
+    # ── Speaker output ────────────────────────────────────────────────────
 
     def _speaker_thread(self):
-        """Drain _audio_out_q and play via sounddevice."""
         if not sd:
             return
-
         stream = sd.OutputStream(samplerate=OUTPUT_RATE, channels=1, dtype="float32")
         stream.start()
         try:
@@ -395,33 +487,30 @@ Write the BOOT_PAYLOAD for the next AI node."""
             stream.stop()
             stream.close()
 
-    # ── Manual command loop (keyboard) ─────────────────────────────────────
+    # ── Keyboard commands ─────────────────────────────────────────────────
 
     async def _command_loop(self):
-        """Simple keyboard command interface for manual control."""
-        cmds = """
+        print("""
   Commands:
-    s         — switch to standby (if primed)
-    f         — switch to filler (immediate)
-    r         — reset filler
-    p <text>  — prime standby with custom prompt
-    t         — show transcript
-    n         — show node status
-    q         — quit
-"""
-        print(cmds)
+    s        — switch to standby (if primed)
+    f        — switch to filler (immediate)
+    r        — reset filler
+    p <text> — prime standby with custom prompt
+    b        — trigger brain query now
+    t        — print full transcript
+    n        — print node status
+    q        — quit
+""")
         loop = asyncio.get_event_loop()
         while True:
             try:
                 line = await loop.run_in_executor(None, sys.stdin.readline)
-                line = line.strip()
             except Exception:
                 break
-
+            line = line.strip()
             if not line:
                 continue
             if line == "q":
-                print("Quitting...")
                 if self.ws:
                     await self.ws.close()
                 break
@@ -432,84 +521,73 @@ Write the BOOT_PAYLOAD for the next AI node."""
             elif line == "r":
                 await self.send_node_stop("filler")
             elif line.startswith("p "):
-                prompt = line[2:].strip()
-                await self.send_node_prime(prompt)
+                await self.send_node_prime(line[2:].strip())
+            elif line == "b":
+                # Force brain query
+                self._last_brain_t = 0.0
+                self._maybe_query_brain()
+                print("  [brain] Query triggered.")
             elif line == "t":
                 print(f"\n--- Transcript ---\n{self.transcript.get()}\n---")
             elif line == "n":
                 print(f"\n  Node state: {self.node_state}")
             else:
-                print(f"  Unknown command: {line}")
+                print(f"  Unknown command: {line!r}")
 
-    # ── Session setup ──────────────────────────────────────────────────────
+    # ── Session setup ─────────────────────────────────────────────────────
 
     async def _send_session_update(self):
-        """Send session.update with persona and voice."""
         session: dict = {
-            "instructions": self.args.persona,
+            "instructions":  self.args.persona,
             "filler_prompt": self.args.filler,
         }
-
-        # Encode voice
-        if self.args.voice and self.args.voice.upper() in VOICE_NAMES:
-            session["text_prompt_tokens"] = encode_voice_tokens(self.args.voice.upper())
+        v = self.args.voice.upper()
+        if v in VOICE_NAMES:
+            session["text_prompt_tokens"] = encode_voice_tokens(v)
 
         await self._send({"type": "session.update", "session": session})
-        print(f"  Sent session.update, waiting for session.ready...")
+        print("  Sent session.update, waiting for session.ready...")
 
-    # ── Main run ───────────────────────────────────────────────────────────
+    # ── Main ──────────────────────────────────────────────────────────────
 
     async def run(self):
         url = f"ws://{self.args.host}:{self.args.port}/v1/realtime"
         print(f"Connecting to {url} ...")
 
-        # Start speaker thread
-        speaker_t = threading.Thread(target=self._speaker_thread, daemon=True)
-        speaker_t.start()
-
+        threading.Thread(target=self._speaker_thread, daemon=True).start()
         self.loop = asyncio.get_event_loop()
 
         try:
-            async with websockets.connect(url, max_size=16*1024*1024) as ws:
+            async with websockets.connect(url, max_size=32*1024*1024) as ws:
                 self.ws = ws
                 print("Connected!")
-
-                # Wait for session.created
                 raw = await asyncio.wait_for(ws.recv(), timeout=10)
                 await self._on_message(raw)
-
-                # Send session configuration
                 await self._send_session_update()
-
-                # Run mic sender + command loop + receive loop concurrently
                 await asyncio.gather(
                     self._receive_loop(),
                     self._mic_sender(),
                     self._command_loop(),
                 )
-
         except websockets.exceptions.ConnectionRefusedError:
             print(f"\nERROR: Connection refused at {url}")
-            print("Is the gateway running on the Spark?")
         except asyncio.TimeoutError:
-            print("\nERROR: Timeout waiting for server response")
+            print("\nERROR: Timeout waiting for server")
         except KeyboardInterrupt:
             print("\nInterrupted.")
         finally:
             if self.brain:
-                self.brain.close()
+                self.brain.cleanup()
 
     async def _receive_loop(self):
         async for msg in self.ws:
             await self._on_message(msg)
-
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def pick_voice() -> str:
-    """Interactive voice selection."""
     groups = [
         ("Natural Female", ["NATF0","NATF1","NATF2","NATF3"]),
         ("Natural Male",   ["NATM0","NATM1","NATM2","NATM3"]),
@@ -517,21 +595,18 @@ def pick_voice() -> str:
         ("Varied Male",    ["VARM0","VARM1","VARM2","VARM3","VARM4"]),
     ]
     print("\n  Available voices:")
-    idx = 1
-    flat = []
-    for group_name, voices in groups:
-        print(f"    \u2500\u2500 {group_name} \u2500\u2500")
+    idx, flat = 1, []
+    for name, voices in groups:
+        print(f"    ── {name} ──")
         for v in voices:
             print(f"    {idx:2d}. {v}")
             flat.append(v)
             idx += 1
-    print(f"     0. (no voice prompt \u2014 use default)\n")
-
+    print("     0. (no voice prompt — use default)\n")
     while True:
         try:
             sel = int(input("  Select voice [1-18, 0=default]: ").strip())
-            if sel == 0:
-                return ""
+            if sel == 0: return ""
             if 1 <= sel <= len(flat):
                 print(f"  Selected: {flat[sel-1]}")
                 return flat[sel-1]
@@ -541,15 +616,16 @@ def pick_voice() -> str:
 
 def main():
     p = argparse.ArgumentParser(description="PersonaPlex v3 Brain Client")
-    p.add_argument("--host", default="192.168.2.117")
-    p.add_argument("--port", type=int, default=8998)
+    p.add_argument("--host",  default="192.168.2.117")
+    p.add_argument("--port",  type=int, default=8998)
     p.add_argument("--persona", default="You are a helpful, friendly AI assistant.")
     p.add_argument("--filler",  default="Hold on, I'm working on that for you. Just a moment.")
-    p.add_argument("--voice",   default="", help="Voice name e.g. NATF0, or blank for interactive")
-    p.add_argument("--openrouter-key", default=os.environ.get("OPENROUTER_API_KEY", ""),
-                   help="OpenRouter API key (or set OPENROUTER_API_KEY env var)")
-    p.add_argument("--model", default=OPENROUTER_MODEL, help="OpenRouter model to use")
-    p.add_argument("--no-brain", action="store_true", help="Disable brain (audio test only)")
+    p.add_argument("--voice",   default="", help="Voice e.g. NATF0, or blank for interactive")
+    p.add_argument("--google-api-key",
+                   default=os.environ.get("GOOGLE_API_KEY", ""),
+                   help="Google AI API key (or set GOOGLE_API_KEY env var)")
+    p.add_argument("--model", default=GEMINI_MODEL)
+    p.add_argument("--no-brain", action="store_true")
     args = p.parse_args()
 
     print(f"""
@@ -557,16 +633,14 @@ PersonaPlex v3 Brain Client
   Server  : {args.host}:{args.port}
   Persona : {args.persona[:60]}
   Filler  : {args.filler[:60]}
-  Model   : {args.model if not args.no_brain else 'disabled'}
+  Brain   : {'disabled' if args.no_brain else f'Gemini {args.model} + context caching'}
 """)
 
-    # Interactive voice selection if not provided
     if not args.voice:
         args.voice = pick_voice()
 
-    client = PersonaPlexClient(args)
     try:
-        asyncio.run(client.run())
+        asyncio.run(PersonaPlexClient(args).run())
     except KeyboardInterrupt:
         pass
 
