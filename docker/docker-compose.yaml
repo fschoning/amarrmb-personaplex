@@ -33,7 +33,7 @@ services:
       VLLM_ATTENTION_BACKEND: "FLASH_ATTN"
       VLLM_WORKER_MULTIPROC_METHOD: "spawn"
     volumes:
-      - ${HF_CACHE_DIR:-/mnt/models/hf-cache}:/root/.cache/huggingface
+      - ${HF_CACHE_DIR:-${HOME}/.cache/huggingface}:/root/.cache/huggingface
       - ${MODELS_DIR:-/mnt/models}:/mnt/models:ro
       - ../tools:/tools:ro
     deploy:
