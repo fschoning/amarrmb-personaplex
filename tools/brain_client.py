@@ -111,7 +111,17 @@ VOICE_NAMES = [
     "VARF0","VARF1","VARF2","VARF3","VARF4",
     "VARM0","VARM1","VARM2","VARM3","VARM4",
 ]
-VOICE_SENTINEL = -999
+VOICE_SENTINEL      = -999   # prefix: voice name follows as ASCII int32s
+VOICE_TEXT_SENTINEL = -998   # separator: SentencePiece text tokens follow
+
+# Pre-tokenised filler instruction using Moshi's SentencePiece tokeniser.
+# Run `python3 tools/check_voices.py --download` on the Spark to obtain these.
+# The pipeline model conditions the filler LM on this text before conversation.
+# Instruction: "hold on" variants only, never answer questions.
+#
+# TO UPDATE: run on Spark:  python3 tools/check_voices.py
+# Copy the FILLER_TEXT_TOKENS list from the output into here.
+FILLER_TEXT_TOKENS: list[int] = []   # ← populate from check_voices.py output
 
 # ---------------------------------------------------------------------------
 # Prompt templates
@@ -190,7 +200,17 @@ def pcm16_to_float32(data: bytes):
     return np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
 
 def encode_voice_tokens(voice_name: str) -> list:
+    """Encode voice name as [-999, ASCII...] for the pipeline model."""
     return [VOICE_SENTINEL] + [ord(c) for c in voice_name]
+
+def encode_voice_with_text(voice_name: str, text_tokens: list[int]) -> list:
+    """Dual-sentinel encoding: [-999, voiceASCII..., -998, tok1, tok2...]
+    Lets the pipeline model load BOTH a voice prompt AND a text instruction.
+    """
+    return ([VOICE_SENTINEL]
+            + [ord(c) for c in voice_name]
+            + [VOICE_TEXT_SENTINEL]
+            + text_tokens)
 
 # ---------------------------------------------------------------------------
 # Transcript
@@ -919,6 +939,15 @@ class PersonaPlexClient:
         v = self.args.voice.upper()
         if v in VOICE_NAMES:
             session["text_prompt_tokens"] = encode_voice_tokens(v)
+            # Filler gets same voice + the "hold on" text instruction
+            # (dual-sentinel: [-999, voiceASCII..., -998, textTok1, ...])
+            if FILLER_TEXT_TOKENS:
+                session["filler_text_tokens"] = encode_voice_with_text(v, FILLER_TEXT_TOKENS)
+            else:
+                # No text tokens yet — filler gets voice only, no instruction.
+                # Run `python3 tools/check_voices.py` on Spark to get tokens.
+                session["filler_text_tokens"] = encode_voice_tokens(v)
+                print("  [warn] FILLER_TEXT_TOKENS empty — run check_voices.py on Spark")
         await self._send({"type": "session.update", "session": session})
         print("  Sent session.update, waiting for session.ready...")
 

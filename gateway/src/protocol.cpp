@@ -144,9 +144,7 @@ bool parse_client_event(const char* data, size_t len, ClientEvent& out) {
         if (sess["top_k"].get(itmp) == simdjson::SUCCESS)
             out.session.top_k = static_cast<int>(itmp);
 
-        // Parse text_prompt_tokens array (used for voice name delivery)
-        // Wrapped in try/catch because simdjson ondemand can fail silently
-        // when the field doesn't exist in certain document positions.
+        // Parse text_prompt_tokens
         try {
             simdjson::ondemand::array tok_arr;
             if (sess["text_prompt_tokens"].get_array().get(tok_arr) == simdjson::SUCCESS) {
@@ -156,9 +154,19 @@ bool parse_client_event(const char* data, size_t len, ClientEvent& out) {
                         out.session.text_prompt_tokens.push_back(static_cast<int32_t>(v));
                 }
             }
-        } catch (...) {
-            // Field missing or not an array — voice is optional
-        }
+        } catch (...) {}
+
+        // Parse filler_text_tokens (voice name + "hold on" instruction, dual-sentinel)
+        try {
+            simdjson::ondemand::array ftok_arr;
+            if (sess["filler_text_tokens"].get_array().get(ftok_arr) == simdjson::SUCCESS) {
+                for (auto val : ftok_arr) {
+                    int64_t v;
+                    if (val.get_int64().get(v) == simdjson::SUCCESS)
+                        out.session.filler_text_tokens.push_back(static_cast<int32_t>(v));
+                }
+            }
+        } catch (...) {}
 
         // persona_prompt and filler_prompt
         if (sess["persona_prompt"].get(sv) == simdjson::SUCCESS)

@@ -259,22 +259,44 @@ class TritonPythonModel:
                 if raw.size > 0:
                     self._voice_prompt_bytes = raw.flat[0]
 
-            # Extract text prompt tokens — may contain voice name
-            # Convention: [-999, ascii, ascii, ...] = voice name (e.g. [-999, 78,65,84,70,50] = "NATF2")
-            # Normal SentencePiece tokens are always >= 0
+            # Extract text prompt tokens — supports dual-sentinel encoding:
+            #   [-999, a,s,c,i,i...]          → voice name only
+            #   [tok1, tok2, ...]              → text tokens only
+            #   [-999, a,s,c,i,i..., -998, tok1, tok2, ...] → voice name + text tokens
+            # Sentinel -999: voice name (ASCII int32 chars follow)
+            # Sentinel -998: separator between voice name and text tokens
             self._voice_name = None
             tp_tensor = pb_utils.get_input_tensor_by_name(request, "TEXT_PROMPT_TOKENS")
             if tp_tensor is not None:
                 tok = tp_tensor.as_numpy().flatten()
                 if tok.size > 1 and tok[0] == -999:
-                    # Voice name encoded as ASCII int32
-                    self._voice_name = "".join(chr(c) for c in tok[1:] if 32 <= c < 128)
-                    self._text_prompt_tokens = None
-                    self.logger.log_info(f"personaplex_pipeline: voice name from tokens: '{self._voice_name}'")
+                    # Find -998 separator if present
+                    sep_idx = None
+                    for i, v in enumerate(tok):
+                        if v == -998:
+                            sep_idx = i
+                            break
+                    if sep_idx is not None:
+                        # Dual: voice name up to separator, text tokens after
+                        self._voice_name = "".join(
+                            chr(c) for c in tok[1:sep_idx] if 32 <= c < 128)
+                        rest = tok[sep_idx + 1:]
+                        self._text_prompt_tokens = rest.tolist() if rest.size > 0 else None
+                        self.logger.log_info(
+                            f"personaplex_pipeline: voice='{self._voice_name}' "
+                            f"+ {len(self._text_prompt_tokens or [])} text tokens")
+                    else:
+                        # Voice name only (legacy / no text instruction)
+                        self._voice_name = "".join(
+                            chr(c) for c in tok[1:] if 32 <= c < 128)
+                        self._text_prompt_tokens = None
+                        self.logger.log_info(
+                            f"personaplex_pipeline: voice name from tokens: '{self._voice_name}'")
                 elif tok.size > 0:
                     self._text_prompt_tokens = tok.tolist()
                 else:
                     self._text_prompt_tokens = None
+
 
             self.logger.log_info("personaplex_pipeline: running system prompts...")
             self._run_system_prompts()

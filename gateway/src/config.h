@@ -15,9 +15,10 @@ namespace pg {
 struct SessionConfig {
     std::string              instructions;           // text system prompt (persona)
     std::string              voice_prompt_embedding; // base64-encoded .pt bytes
-    std::vector<int32_t>     text_prompt_tokens;     // optional: voice name as int32 sentinel
+    std::vector<int32_t>     text_prompt_tokens;     // voice name as int32 sentinel + optional text
+    std::vector<int32_t>     filler_text_tokens;     // filler: same voice + "hold on" instruction
     std::string              persona_prompt;         // orchestrator persona
-    std::string              filler_prompt;          // Filler PP system prompt
+    std::string              filler_prompt;          // Filler PP system prompt (for brain/UI)
     std::string              input_audio_format  = "pcm16";
     std::string              output_audio_format = "pcm16";
     float                    temperature         = 0.8f;

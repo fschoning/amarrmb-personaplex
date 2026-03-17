@@ -346,19 +346,22 @@ void Orchestrator::init_filler(const std::string& prompt) {
     }
     std::vector<int32_t> text_tokens = sess_->config.text_prompt_tokens;
 
-    // Encode filler system prompt as text tokens (prefix with filler marker)
-    // The Filler PP gets a short, forceful system prompt:
-    //   "You are a pause-filler. ONLY say variations of: 'I'm working on that for you,
-    //    just a moment'. Never answer questions. Never provide information."
-    // For now: pass standard voice tokens, log the prompt.
-    // Phase 2: inject the prompt text into the LM context.
-    fprintf(stderr, "[orchestrator] init_filler: corrid=%ld prompt=%.60s...\n",
-            kCorridFiller, prompt.c_str());
+    // Filler tokens: prefer filler_text_tokens (voice + "hold on" instruction),
+    // fall back to plain text_prompt_tokens (voice only — no instruction).
+    // The dual-sentinel format [-999, voiceASCII..., -998, tok1, tok2...] is
+    // decoded by the pipeline model to load both voice and text conditioning.
+    const std::vector<int32_t>& filler_tokens =
+        !sess_->config.filler_text_tokens.empty()
+            ? sess_->config.filler_text_tokens
+            : sess_->config.text_prompt_tokens;
+
+    fprintf(stderr, "[orchestrator] init_filler: corrid=%ld tokens=%zu prompt=%.60s...\n",
+            kCorridFiller, filler_tokens.size(), prompt.c_str());
 
     ts_filler_ = std::make_unique<TritonSession>(
         cfg_.triton_url, cfg_.pipeline_model, kCorridFiller, cfg_.model_version);
 
-    if (!ts_filler_->send_start(voice_bytes, text_tokens)) {
+    if (!ts_filler_->send_start(voice_bytes, filler_tokens)) {
         fprintf(stderr, "[orchestrator] Filler send_start failed.\n");
         ts_filler_.reset();
         return;
