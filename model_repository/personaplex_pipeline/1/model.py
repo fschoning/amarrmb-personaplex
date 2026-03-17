@@ -201,9 +201,12 @@ class TritonPythonModel:
         if _DEVICE.type == "cuda":
             torch.cuda.synchronize()
 
-        # Reset again to clear warmup residue before real conversation
+        # Reset mimi only — DO NOT reset lm_gen here!
+        # lm_gen.reset_streaming() would wipe the voice + persona conditioning
+        # from the LM's KV cache, reverting to the default "Moshi" voice/identity.
+        # The mimi reset is safe — it only clears the audio codec's streaming state.
         self.mimi.reset_streaming()
-        self.lm_gen.reset_streaming()
+        self.logger.log_info("personaplex_pipeline: warmup done, voice+persona conditioning preserved")
 
     # ------------------------------------------------------------------
     # Main execute — ALL processing in one function call, zero IPC

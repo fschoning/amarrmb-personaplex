@@ -122,7 +122,20 @@ Orchestrator::Orchestrator(const Config& cfg, std::shared_ptr<Session> sess, Sen
     }
 }
 
-Orchestrator::~Orchestrator() {}
+Orchestrator::~Orchestrator() {
+    // Signal the session to stop so background threads see it
+    if (sess_) sess_->should_close.store(true);
+
+    // Wait for priming thread to finish (avoid use-after-free crash)
+    if (priming_thread_.joinable()) {
+        try { priming_thread_.join(); } catch (...) {}
+    }
+
+    // Tear down Triton sessions
+    if (ts_filler_)  { try { ts_filler_->send_end();  } catch (...) {} }
+    if (ts_standby_) { try { ts_standby_->send_end(); } catch (...) {} }
+    if (ts_active_)  { try { ts_active_->send_end();  } catch (...) {} }
+}
 
 // ---------------------------------------------------------------------------
 // run — main audio loop (blocks until session ends)
