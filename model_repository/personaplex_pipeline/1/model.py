@@ -120,6 +120,8 @@ class TritonPythonModel:
         self._text_prompt_tokens: Optional[list]  = None
         self._active = False
         self._frame_count = 0
+        self._text_tokens: list = []          # accumulated text token IDs
+        self._last_decoded_len: int = 0       # chars already output
 
         self.logger.log_info("personaplex_pipeline: ready.")
 
@@ -306,6 +308,14 @@ class TritonPythonModel:
             main_pcm = self.mimi.decode(tokens[:, 1:9])  # [1, 1, 1920]
             pcm_frames.append(main_pcm)
 
+        # Decode text token to string (incremental)
+        new_text = ""
+        if last_text_token > 0 and last_text_token < 32000:
+            self._text_tokens.append(last_text_token)
+            decoded = self.text_tokenizer.DecodeIds(self._text_tokens)
+            new_text = decoded[self._last_decoded_len:]
+            self._last_decoded_len = len(decoded)
+
         t2 = time.monotonic()
 
         if pcm_frames:
@@ -342,16 +352,20 @@ class TritonPythonModel:
         return self._make_response(
             pcm=out_48k,
             text_token=np.array([last_text_token], dtype=np.int32),
+            text_decoded=new_text,
             ready=np.array([False]),
         )
 
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _make_response(pcm, text_token, ready):
+    def _make_response(pcm, text_token, ready, text_decoded=""):
+        # Encode text_decoded as a numpy string array for Triton
+        td_np = np.array([text_decoded], dtype=object)
         return pb_utils.InferenceResponse(output_tensors=[
             pb_utils.Tensor("OUTPUT_PCM_48K", pcm),
             pb_utils.Tensor("TEXT_TOKEN",     text_token),
+            pb_utils.Tensor("TEXT_DECODED",   td_np),
             pb_utils.Tensor("SESSION_READY",  ready),
         ])
 

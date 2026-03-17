@@ -14,6 +14,7 @@ input [
 output [
   { name: "OUTPUT_PCM_48K"  data_type: TYPE_FP32   dims: [1, 1, -1] },
   { name: "TEXT_TOKEN"       data_type: TYPE_INT32  dims: [1] },
+  { name: "TEXT_DECODED"     data_type: TYPE_STRING dims: [1] },
   { name: "SESSION_READY"   data_type: TYPE_BOOL   dims: [1] }
 ]
 

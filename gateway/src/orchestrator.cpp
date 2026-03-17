@@ -63,9 +63,20 @@ void TranscriptBuffer::push_token(int32_t token) {
         tokens_.pop_front();
 }
 
+void TranscriptBuffer::push_text(const std::string& text) {
+    if (text.empty()) return;
+    std::lock_guard<std::mutex> lk(mtx_);
+    decoded_text_ += text;
+    // Keep decoded text from growing unbounded (~50K chars max)
+    if (decoded_text_.size() > 50000) {
+        decoded_text_ = decoded_text_.substr(decoded_text_.size() - 40000);
+    }
+}
+
 void TranscriptBuffer::clear() {
     std::lock_guard<std::mutex> lk(mtx_);
     tokens_.clear();
+    decoded_text_.clear();
 }
 
 std::vector<int32_t> TranscriptBuffer::recent_tokens(int n) const {
@@ -76,9 +87,7 @@ std::vector<int32_t> TranscriptBuffer::recent_tokens(int n) const {
 
 std::string TranscriptBuffer::as_text() const {
     std::lock_guard<std::mutex> lk(mtx_);
-    std::ostringstream oss;
-    for (int32_t t : tokens_) oss << t << " ";
-    return oss.str();
+    return decoded_text_;
 }
 
 int TranscriptBuffer::size() const {
@@ -160,20 +169,24 @@ void Orchestrator::run() {
         if (out.text_token > 0 && out.text_token < 32000) {
             transcript_.push_token(out.text_token);
         }
+        // Decoded text from PP → transcript
+        if (!out.text_decoded.empty()) {
+            transcript_.push_text(out.text_decoded);
+        }
 
         ++frame_no_;
         ++frames_since_trigger_;
 
-        // ── Brain always-on ────────────────────────────────────────────────
-        // With MPS, brain has dedicated GPU SMs — keep them busy.
-        // Fire brain immediately on first tokens, and re-fire as soon as
-        // the previous query completes.  Boot payload stays always-fresh.
+        // Fire brain every ~5 seconds when not in-flight and there's new text
+        constexpr int kBrainEveryFrames = 62;  // 62 × 80ms ≈ 5s
         if (brain_available_
             && !brain_in_flight_.load()
-            && transcript_.size() >= 10)    // wait for minimal context
+            && transcript_.size() >= 10
+            && frames_since_trigger_ >= kBrainEveryFrames)
         {
             std::string prompt = build_brain_prompt(persona_);
             request_brain_async(prompt);
+            frames_since_trigger_ = 0;  // reset for next brain cycle
         }
 
         // ── Switch every 30s ───────────────────────────────────────────────
@@ -256,7 +269,7 @@ void Orchestrator::request_brain_async(const std::string& prompt) {
     brain_thread_ = std::thread([this, prompt]() {
         fprintf(stderr, "[brain] querying (prompt_len=%zu)...\n", prompt.size());
         auto t0   = std::chrono::steady_clock::now();
-        std::string response = brain_->query(prompt, 64);
+        std::string response = brain_->query(prompt, 200);
         auto ms   = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - t0).count();
         fprintf(stderr, "[brain] response in %ldms: %.80s...\n", ms, response.c_str());
@@ -372,29 +385,44 @@ bool Orchestrator::should_trigger_brain() const {
 // build_brain_prompt — assemble the prompt to send to the brain LLM
 // ---------------------------------------------------------------------------
 std::string Orchestrator::build_brain_prompt(const std::string& persona) const {
+    std::string transcript = transcript_.as_text();
     int n_tokens = transcript_.size();
+    int duration_s = frame_no_ * 80 / 1000;
 
-    // NOTE: text_tokens from PersonaPlex are audio-codebook IDs, not text.
-    // We cannot decode them to words without SentencePiece (Phase 4).
-    // Instead, give the brain the metadata it CAN act on.
     std::ostringstream oss;
-    oss << "You are writing a context handoff note for a voice AI."
-        << " The AI's persona: " << persona << "\n"
-        << "The AI has been speaking continuously for approximately "
-        << (frame_no_ * 80 / 1000) << " seconds."
-        << " During this time it generated " << n_tokens << " speech token(s)."
-        << " It is having a natural conversation with a user.\n\n"
-        << "Write a short BOOT_PAYLOAD (max 60 words) for the \"next instance\" of this AI "
-        << "so it can continue the conversation naturally. Structure:\n"
-        << "[SUMMARY] What the AI was probably discussing (infer from persona + time)\n"
-        << "[CONTEXT] Any relevant knowledge the AI should have ready\n"
-        << "[EMOTION] Tone of voice to match (warm, curious, etc)\n"
+    oss << "You are the brain behind a voice AI agent. "
+        << "Your job is to write a context handoff note so a new instance "
+        << "of the AI can continue the conversation seamlessly.\n\n"
+        << "AI Persona: " << persona << "\n"
+        << "Session duration: " << duration_s << " seconds\n"
+        << "Speech tokens generated: " << n_tokens << "\n\n";
+
+    if (!transcript.empty()) {
+        // Include the last ~4000 chars of transcript (most recent ~3 minutes)
+        std::string recent = transcript;
+        if (recent.size() > 4000) {
+            recent = "..." + recent.substr(recent.size() - 4000);
+        }
+        oss << "=== TRANSCRIPT (AI speech) ===\n"
+            << recent << "\n"
+            << "=== END TRANSCRIPT ===\n\n";
+    } else {
+        oss << "(No transcript yet -- conversation just started)\n\n";
+    }
+
+    oss << "Based on the transcript above, write a BOOT_PAYLOAD for the "
+        << "next AI instance. Structure your response EXACTLY as:\n"
+        << "[SUMMARY] What was being discussed (key topics, names, facts)\n"
+        << "[CONTEXT] What the AI should know to continue naturally\n"
+        << "[LAST_TOPIC] The most recent topic/question being addressed\n"
+        << "[EMOTION] Tone of voice to match\n"
         << "[PERSONA] " << persona;
+
     return oss.str();
 }
 
 // ---------------------------------------------------------------------------
-// build_boot_payload — wrap brain response in PersonaPlex system format
+// build_boot_payload -- wrap brain response in PersonaPlex system format
 // ---------------------------------------------------------------------------
 std::string Orchestrator::build_boot_payload(const std::string& brain_response) const {
     std::ostringstream oss;

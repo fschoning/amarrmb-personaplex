@@ -122,12 +122,15 @@ bool TritonSession::infer_one(
     // --- Requested outputs ---
     tc::InferRequestedOutput* out_pcm = nullptr;
     tc::InferRequestedOutput* out_tok = nullptr;
+    tc::InferRequestedOutput* out_txt = nullptr;
     tc::InferRequestedOutput* out_rdy = nullptr;
     check(tc::InferRequestedOutput::Create(&out_pcm, "OUTPUT_PCM_48K"), "req_pcm");
     check(tc::InferRequestedOutput::Create(&out_tok, "TEXT_TOKEN"),      "req_tok");
+    check(tc::InferRequestedOutput::Create(&out_txt, "TEXT_DECODED"),    "req_txt");
     check(tc::InferRequestedOutput::Create(&out_rdy, "SESSION_READY"),   "req_rdy");
     outputs.push_back(out_pcm);
     outputs.push_back(out_tok);
+    outputs.push_back(out_txt);
     outputs.push_back(out_rdy);
 
     // --- Infer ---
@@ -167,6 +170,19 @@ bool TritonSession::infer_one(
         res->RawData("TEXT_TOKEN",
             reinterpret_cast<const uint8_t**>(&tok_ptr), &tok_bytes);
         out.text_token = tok_bytes >= 4 ? tok_ptr[0] : 0;
+
+        // TEXT_DECODED (Triton BYTES: 4-byte length prefix + string data)
+        const uint8_t* td_raw = nullptr;
+        size_t td_bytes = 0;
+        auto td_err = res->RawData("TEXT_DECODED", &td_raw, &td_bytes);
+        if (td_err.IsOk() && td_bytes > 4) {
+            uint32_t str_len = 0;
+            std::memcpy(&str_len, td_raw, 4);
+            if (str_len > 0 && 4 + str_len <= td_bytes) {
+                out.text_decoded.assign(
+                    reinterpret_cast<const char*>(td_raw + 4), str_len);
+            }
+        }
 
         // SESSION_READY
         const bool* rdy_ptr = nullptr;

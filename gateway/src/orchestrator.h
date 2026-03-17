@@ -61,14 +61,13 @@ public:
     explicit TranscriptBuffer(int max_tokens = 500);
 
     void push_token(int32_t token);
+    void push_text(const std::string& text);  // Append decoded text from PP
     void clear();
 
     // Returns raw token IDs for recent N tokens
     std::vector<int32_t> recent_tokens(int n = 50) const;
 
-    // Returns a plaintext representation (token IDs as space-separated ints).
-    // Real decoding requires SentencePiece; for now tokens are formatted as
-    // integers which the brain can still reason about.
+    // Returns accumulated decoded text from the PP pipeline.
     std::string as_text() const;
 
     int size() const;
@@ -77,6 +76,7 @@ private:
     int                  max_tokens_;
     mutable std::mutex   mtx_;
     std::deque<int32_t>  tokens_;
+    std::string          decoded_text_;  // Accumulated decoded text
 };
 
 // ---------------------------------------------------------------------------

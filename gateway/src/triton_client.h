@@ -31,6 +31,7 @@ namespace pg {
 struct FrameOutput {
     std::vector<float> pcm_48k;           // 3840 float32 samples (80ms at 48kHz)
     int32_t            text_token = 0;
+    std::string        text_decoded;       // Incrementally decoded text from SentencePiece
     bool               session_ready = false;
 };
 
