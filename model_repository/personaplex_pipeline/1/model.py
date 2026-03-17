@@ -154,9 +154,32 @@ class TritonPythonModel:
     # ------------------------------------------------------------------
 
     def _run_system_prompts(self):
+        # ── PHASE 1: Warmup (eat torch.compile re-trace cost) ──────────
+        # reset_streaming() invalidates torch.compile guards, so the first
+        # encode/decode triggers a re-trace (~2-4s). Do it NOW, not during
+        # real-time conversation. This runs on SILENCE before any conditioning.
         self.mimi.reset_streaming()
+        self.lm_gen.reset_streaming()
 
-        # Voice loading: name-based (from tokens) or binary (from voice_prompt_bytes)
+        frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
+        for _ in range(4):
+            chunk = torch.zeros(1, 1, frame_size, dtype=self._input_dtype, device=_DEVICE)
+            codes = self.mimi.encode(chunk)
+            for c in range(codes.shape[-1]):
+                tokens = self.lm_gen.step(codes[:, :, c:c + 1])
+                if tokens is not None:
+                    _ = self.mimi.decode(tokens[:, 1:9])
+        if _DEVICE.type == "cuda":
+            torch.cuda.synchronize()
+        self.logger.log_info("personaplex_pipeline: warmup done (torch.compile traces cached)")
+
+        # ── PHASE 2: Full reset (clear warmup conversation state) ──────
+        # Warmup generated tokens/audio — wipe ALL state before conditioning.
+        self.mimi.reset_streaming()
+        self.lm_gen.reset_streaming()
+
+        # ── PHASE 3: Voice + persona conditioning ──────────────────────
+        # Load voice embeddings
         if hasattr(self, '_voice_name') and self._voice_name:
             voice_path = self._resolve_voice_name(self._voice_name)
             if voice_path:
@@ -174,39 +197,20 @@ class TritonPythonModel:
             except OSError:
                 pass
 
+        # Set text prompt tokens (persona instruction)
         if self._text_prompt_tokens:
             self.lm_gen.text_prompt_tokens = self._text_prompt_tokens
         else:
-            # Must be an iterable (not None) — _step_text_prompt_core iterates it
             self.lm_gen.text_prompt_tokens = []
 
+        # Run system prompts — bakes voice + persona into LM's KV cache
         self.lm_gen.step_system_prompts(self.mimi)
 
-        # CRITICAL: reset mimi streaming AFTER system prompts (matches server.py line 346)
-        # System prompts leave residual state in mimi's streaming buffers
+        # Reset ONLY mimi (audio codec) — preserve LM conditioning
+        # The LM's KV cache now contains the voice + persona conditioning.
+        # DO NOT call lm_gen.reset_streaming() here — that would wipe it.
         self.mimi.reset_streaming()
-
-        # Post-system-prompt warmup: eat torch.compile re-trace cost HERE
-        # instead of during real-time frames. reset_streaming() invalidates
-        # torch.compile guards, so the first encode/decode after reset triggers
-        # a re-trace (~2-4s). Run it now during session setup.
-        frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
-        for _ in range(4):
-            chunk = torch.zeros(1, 1, frame_size, dtype=self._input_dtype, device=_DEVICE)
-            codes = self.mimi.encode(chunk)
-            for c in range(codes.shape[-1]):
-                tokens = self.lm_gen.step(codes[:, :, c:c + 1])
-                if tokens is not None:
-                    _ = self.mimi.decode(tokens[:, 1:9])
-        if _DEVICE.type == "cuda":
-            torch.cuda.synchronize()
-
-        # Reset mimi only — DO NOT reset lm_gen here!
-        # lm_gen.reset_streaming() would wipe the voice + persona conditioning
-        # from the LM's KV cache, reverting to the default "Moshi" voice/identity.
-        # The mimi reset is safe — it only clears the audio codec's streaming state.
-        self.mimi.reset_streaming()
-        self.logger.log_info("personaplex_pipeline: warmup done, voice+persona conditioning preserved")
+        self.logger.log_info("personaplex_pipeline: conditioning done, LM state preserved")
 
     # ------------------------------------------------------------------
     # Main execute — ALL processing in one function call, zero IPC
