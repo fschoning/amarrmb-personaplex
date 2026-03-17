@@ -22,8 +22,9 @@ VOICE_NAMES = [
     "VARM0","VARM1","VARM2","VARM3","VARM4",
 ]
 
-# HF repo for Moshi model files
-DEFAULT_HF_REPO = os.environ.get("HF_REPO", "kyutai/moshi")
+# HF repo that holds the Moshi voice .pt files and tokenizer
+# (nvidia/personaplex-7b-v1, NOT kyutai/moshi)
+DEFAULT_HF_REPO = os.environ.get("HF_REPO", "nvidia/personaplex-7b-v1")
 
 # The filler persona instruction — carefully worded so Moshi conditions
 # on being a polite pause-holder that never answers questions.
