@@ -229,7 +229,7 @@ void Orchestrator::run() {
 
         // ── Send audio to client ──────────────────────────────────────────
         if (!out.pcm_48k.empty()) {
-            std::string b64 = encode_pcm16_b64(out.pcm_48k);
+            std::string b64 = encode_audio_delta(out.pcm_48k.data(), out.pcm_48k.size());
             send_(make_audio_delta(resp_id, item_id, b64));
         }
 
