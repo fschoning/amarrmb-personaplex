@@ -415,7 +415,7 @@ class Detector:
 
         self._client = live_genai.Client(
             api_key=api_key,
-            http_options={"api_version": "v1beta"},
+            http_options={"api_version": "v1alpha"},
         )
 
         self._eval_event  = None   # asyncio.Event

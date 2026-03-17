@@ -301,8 +301,9 @@ class TritonPythonModel:
                     self._text_prompt_tokens = None
 
             # PERSONA_TEXT: raw persona string, tokenized server-side
-            # If we don't already have text_prompt_tokens from dual-sentinel,
-            # tokenize the persona text and use it instead.
+            # Wrap in a strong system instruction to reliably override Moshi's
+            # fine-tuned default identity. Short prompts (11 tokens) are too weak
+            # and get overridden probabilistically. We need ~50+ tokens.
             persona_tensor = pb_utils.get_input_tensor_by_name(request, "PERSONA_TEXT")
             if persona_tensor is not None:
                 persona_raw = persona_tensor.as_numpy()
@@ -312,11 +313,22 @@ class TritonPythonModel:
                         persona_str = persona_raw.flat[0].decode("utf-8", errors="replace")
                     persona_str = persona_str.strip()
                     if persona_str and self._text_prompt_tokens is None:
-                        persona_tokens = self.text_tokenizer.Encode(persona_str, out_type=int)
+                        # Build a strong persona instruction
+                        strong_persona = (
+                            f"SYSTEM: {persona_str} "
+                            f"You must always stay in character. "
+                            f"Your name is NOT Moshi. You are NOT a podcast host. "
+                            f"Remember: {persona_str} "
+                            f"When you introduce yourself, use the name from your persona. "
+                            f"Stay in character at all times."
+                        )
+                        persona_tokens = self.text_tokenizer.Encode(
+                            strong_persona, out_type=int)
                         self._text_prompt_tokens = persona_tokens
                         self.logger.log_info(
                             f"personaplex_pipeline: persona tokenized: "
-                            f"'{persona_str[:50]}' → {len(persona_tokens)} tokens")
+                            f"'{persona_str[:50]}' → {len(persona_tokens)} tokens "
+                            f"(strong prompt: {len(strong_persona)} chars)")
                     elif persona_str:
                         self.logger.log_info(
                             f"personaplex_pipeline: persona text ignored "
