@@ -45,6 +45,7 @@ bool TritonSession::infer_one(
     bool                         is_end,
     const std::vector<uint8_t>*  voice_bytes,
     const std::vector<int32_t>*  text_tokens,
+    const std::string*           persona_text,
     FrameOutput&                 out)
 {
     std::vector<tc::InferInput*>           inputs;
@@ -117,6 +118,18 @@ bool TritonSession::infer_one(
             tp_t->AppendRaw(reinterpret_cast<uint8_t*>(&zero), sizeof(int32_t));
         }
         inputs.push_back(tp_t);
+    }
+
+    // --- Persona text (raw string, tokenized server-side) ---
+    tc::InferInput* pt_t = nullptr;
+    {
+        check(tc::InferInput::Create(&pt_t, "PERSONA_TEXT", {1}, "BYTES"), "PT");
+        if (is_start && persona_text && !persona_text->empty()) {
+            pt_t->AppendFromString({*persona_text});
+        } else {
+            pt_t->AppendFromString({""});
+        }
+        inputs.push_back(pt_t);
     }
 
     // --- Requested outputs ---
@@ -196,10 +209,11 @@ bool TritonSession::infer_one(
 }
 
 bool TritonSession::send_start(const std::vector<uint8_t>& voice_bytes,
-                                const std::vector<int32_t>& text_tokens) {
+                                const std::vector<int32_t>& text_tokens,
+                                const std::string& persona_text) {
     FrameOutput out;
     bool ok = infer_one(nullptr, /*start=*/true, /*end=*/false,
-                        &voice_bytes, &text_tokens, out);
+                        &voice_bytes, &text_tokens, &persona_text, out);
     if (ok) stream_open_ = true;
     return ok;
 }
@@ -210,12 +224,12 @@ bool TritonSession::send_frame(const float* pcm_24k, size_t n, FrameOutput& out)
           {1, 1, static_cast<int64_t>(n)}, "FP32"), "INPUT_PCM frame");
     pcm_in->AppendRaw(reinterpret_cast<const uint8_t*>(pcm_24k), n * sizeof(float));
 
-    return infer_one(pcm_in, /*start=*/false, /*end=*/false, nullptr, nullptr, out);
+    return infer_one(pcm_in, /*start=*/false, /*end=*/false, nullptr, nullptr, nullptr, out);
 }
 
 bool TritonSession::send_end() {
     FrameOutput out;
-    bool ok = infer_one(nullptr, /*start=*/false, /*end=*/true, nullptr, nullptr, out);
+    bool ok = infer_one(nullptr, /*start=*/false, /*end=*/true, nullptr, nullptr, nullptr, out);
     stream_open_ = false;
     return ok;
 }

@@ -8,7 +8,8 @@ input [
   { name: "START"                  data_type: TYPE_FP32   dims: [1] },
   { name: "END"                    data_type: TYPE_FP32   dims: [1] },
   { name: "VOICE_PROMPT_BYTES"     data_type: TYPE_STRING dims: [1] },
-  { name: "TEXT_PROMPT_TOKENS"     data_type: TYPE_INT32  dims: [-1] }
+  { name: "TEXT_PROMPT_TOKENS"     data_type: TYPE_INT32  dims: [-1] },
+  { name: "PERSONA_TEXT"           data_type: TYPE_STRING dims: [1] }
 ]
 
 output [

@@ -46,7 +46,8 @@ public:
     // Blocking — runs system-prompt conditioning in Triton (~2-5s).
     // Returns false on Triton error.
     bool send_start(const std::vector<uint8_t>& voice_prompt_bytes,
-                    const std::vector<int32_t>& text_prompt_tokens);
+                    const std::vector<int32_t>& text_prompt_tokens,
+                    const std::string& persona_text = "");
 
     // Blocking — sends one 80ms frame (1920 float32 samples at 24kHz).
     // Fills out on success; returns false on Triton error.
@@ -73,6 +74,7 @@ private:
         bool                                     is_end,
         const std::vector<uint8_t>*              voice_bytes,      // nullptr except on START
         const std::vector<int32_t>*              text_tokens,      // nullptr except on START
+        const std::string*                       persona_text,
         FrameOutput&                             out);
 };
 

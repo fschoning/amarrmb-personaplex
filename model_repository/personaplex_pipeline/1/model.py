@@ -297,6 +297,28 @@ class TritonPythonModel:
                 else:
                     self._text_prompt_tokens = None
 
+            # PERSONA_TEXT: raw persona string, tokenized server-side
+            # If we don't already have text_prompt_tokens from dual-sentinel,
+            # tokenize the persona text and use it instead.
+            persona_tensor = pb_utils.get_input_tensor_by_name(request, "PERSONA_TEXT")
+            if persona_tensor is not None:
+                persona_raw = persona_tensor.as_numpy()
+                if persona_raw.size > 0:
+                    persona_str = str(persona_raw.flat[0])
+                    if isinstance(persona_raw.flat[0], bytes):
+                        persona_str = persona_raw.flat[0].decode("utf-8", errors="replace")
+                    persona_str = persona_str.strip()
+                    if persona_str and self._text_prompt_tokens is None:
+                        persona_tokens = self.text_tokenizer.Encode(persona_str, out_type=int)
+                        self._text_prompt_tokens = persona_tokens
+                        self.logger.log_info(
+                            f"personaplex_pipeline: persona tokenized: "
+                            f"'{persona_str[:50]}' → {len(persona_tokens)} tokens")
+                    elif persona_str:
+                        self.logger.log_info(
+                            f"personaplex_pipeline: persona text ignored "
+                            f"(text_prompt_tokens already set from dual-sentinel)")
+
 
             self.logger.log_info("personaplex_pipeline: running system prompts...")
             self._run_system_prompts()

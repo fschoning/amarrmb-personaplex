@@ -87,7 +87,7 @@ FRAME_MS    = 80
 FRAME_SAMPLES_IN  = INPUT_RATE  * FRAME_MS // 1000   # 1920
 FRAME_SAMPLES_OUT = OUTPUT_RATE * FRAME_MS // 1000   # 3840
 
-DETECTOR_MODEL   = "gemini-live-2.5-flash-native-audio"  # Live API (bidiGenerateContent)
+DETECTOR_MODEL   = "gemini-live-2.5-flash-preview"          # Live API (bidiGenerateContent)
 COMPRESSOR_MODEL = "gemini-2.0-flash-001"                  # REST API (stable)
 
 # Keepalive: prime standby every N seconds to prevent prompt amnesia (4-min window)

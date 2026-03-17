@@ -319,13 +319,14 @@ void Orchestrator::init_active() {
     }
     std::vector<int32_t> text_tokens = sess_->config.text_prompt_tokens;
 
-    fprintf(stderr, "[orchestrator] init_active: corrid=%ld voice=%zu text=%zu\n",
-            kCorridActive, voice_bytes.size(), text_tokens.size());
+    fprintf(stderr, "[orchestrator] init_active: corrid=%ld voice=%zu text=%zu persona='%.60s'\n",
+            kCorridActive, voice_bytes.size(), text_tokens.size(),
+            sess_->config.instructions.c_str());
 
     ts_active_ = std::make_unique<TritonSession>(
         cfg_.triton_url, cfg_.pipeline_model, kCorridActive, cfg_.model_version);
 
-    if (!ts_active_->send_start(voice_bytes, text_tokens))
+    if (!ts_active_->send_start(voice_bytes, text_tokens, sess_->config.instructions))
         throw std::runtime_error("Active node send_start failed");
 
     sess_->triton_ready.store(true);
@@ -361,7 +362,7 @@ void Orchestrator::init_filler(const std::string& prompt) {
     ts_filler_ = std::make_unique<TritonSession>(
         cfg_.triton_url, cfg_.pipeline_model, kCorridFiller, cfg_.model_version);
 
-    if (!ts_filler_->send_start(voice_bytes, filler_tokens)) {
+    if (!ts_filler_->send_start(voice_bytes, filler_tokens, sess_->config.filler_prompt)) {
         fprintf(stderr, "[orchestrator] Filler send_start failed.\n");
         ts_filler_.reset();
         return;
@@ -439,10 +440,11 @@ void Orchestrator::cmd_prime(NodeRole target, const std::string& prompt, const s
     if (priming_thread_.joinable()) priming_thread_.join();
 
     priming_thread_ = std::thread([this, voice_bytes = std::move(voice_bytes),
-                                   text_tokens = std::move(text_tokens)]() mutable {
+                                   text_tokens = std::move(text_tokens),
+                                   persona = sess_->config.instructions]() mutable {
         auto* ts = ts_standby_.get();
         if (!ts) return;
-        if (!ts->send_start(voice_bytes, text_tokens)) {
+        if (!ts->send_start(voice_bytes, text_tokens, persona)) {
             fprintf(stderr, "[orchestrator] Standby send_start failed.\n");
             ts_standby_.reset();
             send_(make_error("node_error", "Standby prime failed"));
