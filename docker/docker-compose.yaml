@@ -20,14 +20,7 @@ services:
     image: personaplex-triton:latest
     restart: unless-stopped
     shm_size: '4gb'
-    ipc: host                    # required for MPS daemon communication
-    dns:
-      - 8.8.8.8
-      - 8.8.4.4
-    ports:
-      - "8001:8001"   # gRPC
-      - "8000:8000"   # HTTP (diagnostics only)
-      - "8002:8002"   # Prometheus metrics
+    network_mode: host
     environment:
       MODEL_REPO:          "/models"
       HF_REPO:           "${HF_REPO:-}"
@@ -37,8 +30,6 @@ services:
       LM_TEMPERATURE:    "${LM_TEMPERATURE:-0.8}"
       LM_TOP_K:          "${LM_TOP_K:-250}"
       LOAD_BRAIN:        "0"
-      HF_HUB_OFFLINE:    "1"
-      TRANSFORMERS_OFFLINE: "1"
       VLLM_ATTENTION_BACKEND: "FLASH_ATTN"
       VLLM_WORKER_MULTIPROC_METHOD: "spawn"
     volumes:
