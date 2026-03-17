@@ -69,14 +69,18 @@ struct Session {
 
     // Lifecycle flags (atomic for cross-thread visibility)
     std::atomic<bool>  should_close{false};
-    std::atomic<bool>  ready{false};         // true after session.update received
-    std::atomic<bool>  triton_ready{false};  // true after SESSION_READY from LM
+    std::atomic<bool>&  closed = should_close;  // alias
+    std::atomic<bool>  ready{false};
+    std::atomic<bool>  triton_ready{false};
+
+    // v3: command handler — set by Orchestrator after init, called from uWS thread
+    std::function<void(std::string)>  command_handler;
+    std::mutex                        command_handler_mtx;
 
     // The worker thread that drives Triton inference for this session
     std::thread        worker;
 
     // Callback to post a message back onto the uWS event loop
-    // Set once on session creation; safe to call from any thread.
     std::function<void(std::string)> send_to_client;
 
     explicit Session(int64_t id, std::string sid, int buf_ms);

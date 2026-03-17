@@ -38,10 +38,11 @@ sequence_batching {
 
 instance_group [
   {
-    count: 2
+    count: 3
     kind: KIND_GPU
     gpus: [0]
-    # GPU isolation handled by CUDA MPS (hardware SM partitioning).
-    # Brain KV cache limited to 5% GPU mem — leaves room for 2 PP instances.
+    # Three roles: Active (corrid=1), Standby (corrid=1001), Filler (corrid=2001)
+    # Brain is now client-side (workstation). Full GPU for 3 PP instances.
+    # ~45-60 GB VRAM for 3 instances out of 120 GB available.
   }
 ]

@@ -1,17 +1,17 @@
-# docker/docker-compose.yaml — PersonaPlex v2 full stack
+# docker/docker-compose.yaml — PersonaPlex v3 full stack
 #
-# Brain runs via OpenRouter (Gemini 2.0 Flash) — no GPU needed for brain.
-# PP gets 100% of the Spark GPU.
+# v3 Architecture: Spark = generic PP server, Brain = workstation client
+# Three PP instances: Active + Standby + Filler (no brain container on Spark)
 #
-# Start:  OPENROUTER_API_KEY=sk-... docker compose up -d
+# Start:  docker compose up -d
 # Stop:   docker compose down
 
-name: personaplex-v2
+name: personaplex-v3
 
 services:
 
   # -------------------------------------------------------------------------
-  # Triton Inference Server — PersonaPlex pipeline (100% GPU)
+  # Triton Inference Server — PersonaPlex pipeline (3 PP instances, 100% GPU)
   # -------------------------------------------------------------------------
   triton:
     build:
@@ -19,7 +19,7 @@ services:
       dockerfile: docker/Dockerfile.triton
     image: personaplex-triton:latest
     restart: unless-stopped
-    shm_size: '4gb'
+    shm_size: '6gb'
     network_mode: host
     environment:
       MODEL_REPO:          "/models"
@@ -51,33 +51,8 @@ services:
       start_period: 240s
 
   # -------------------------------------------------------------------------
-  # Brain — Gemini 2.0 Flash via OpenRouter (FastAPI proxy, no GPU needed)
-  # Thin HTTP proxy: gateway → brain → OpenRouter → brain → gateway
-  # Zero GPU load — all inference happens in the cloud
-  # -------------------------------------------------------------------------
-  brain:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.brain
-      network: host
-    image: personaplex-brain:latest
-    restart: unless-stopped
-    network_mode: host
-    environment:
-      OPENROUTER_API_KEY:  "${OPENROUTER_API_KEY}"
-      OPENROUTER_MODEL:    "${OPENROUTER_MODEL:-google/gemini-2.0-flash-001}"
-      BRAIN_PORT:          "8015"
-      BRAIN_MAX_TOKENS:    "${BRAIN_MAX_TOKENS:-200}"
-      BRAIN_TEMPERATURE:   "${BRAIN_TEMPERATURE:-0.7}"
-    healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8015/health')"]
-      interval: 15s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-
-  # -------------------------------------------------------------------------
-  # C++ Gateway (WebSocket → Triton gRPC)
+  # C++ Gateway (WebSocket ↔ Triton gRPC, client-driven node switching)
+  # Brain runs on workstation — no brain container here.
   # -------------------------------------------------------------------------
   gateway:
     build:
@@ -89,15 +64,13 @@ services:
     depends_on:
       triton:
         condition: service_healthy
-      brain:
-        condition: service_healthy
     environment:
-      TRITON_GRPC_URL:    "localhost:8001"      # PP pipeline
-      BRAIN_GRPC_URL:     "localhost:8015"      # Brain FastAPI HTTP
+      TRITON_GRPC_URL:    "localhost:8001"
       MAX_SESSIONS:       "${MAX_SESSIONS:-6}"
       SESSION_TIMEOUT_S:  "${SESSION_TIMEOUT_S:-300}"
       WS_PORT:            "${WS_PORT:-8998}"
       SSL_CERT:           "${SSL_CERT:-}"
       SSL_KEY:            "${SSL_KEY:-}"
+      FILLER_PROMPT:      "${FILLER_PROMPT:-Hold on, I'm working on that for you. Just a moment.}"
 
 # No named volumes — HF cache is bind-mounted from host via HF_CACHE_DIR env var

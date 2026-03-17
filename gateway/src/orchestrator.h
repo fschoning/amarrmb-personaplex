@@ -1,21 +1,19 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 // SPDX-License-Identifier: MIT
 //
-// gateway/src/orchestrator.h — Ping-Pong Orchestrator
+// gateway/src/orchestrator.h — PersonaPlex v3 Orchestrator
 //
-// Owns two TritonSessions (hot + standby) and the Brain LLM client.
-// Core responsibilities:
-//   1. Route PCM: user audio in → hot node → audio out to client
-//   2. Accumulate text tokens from hot node → rolling transcript
-//   3. Detect switch triggers (keyword OR context threshold)
-//   4. Query brain async for boot payload
-//   5. Re-init standby with boot payload
-//   6. On silence: hard-switch hot ↔ standby
-//   7. Tear down old hot, free its Triton sequence slot
+// v3 Architecture (client-driven):
+//   - Spark is a GENERIC PP server. No brain logic here.
+//   - Three PP roles: Active (speaking), Standby (preloaded), Filler (instant ack)
+//   - Client (workstation) sends commands via WebSocket to control nodes
+//   - Transcript text streamed to client in real-time
+//   - Client decides when/how to switch nodes and what context to load
+//
+// Node corrids: Active=1, Standby=1001, Filler=2001
 
 #pragma once
 
-#include "brain_client.h"
 #include "config.h"
 #include "session.h"
 #include "triton_client.h"
@@ -36,127 +34,131 @@ namespace pg {
 // ---------------------------------------------------------------------------
 class SilenceDetector {
 public:
-    // threshold: RMS below this is "silence"
-    // hold_frames: must be silent for this many consecutive frames
     explicit SilenceDetector(float threshold = 0.005f, int hold_frames = 4);
-
-    // Returns true if the last `hold_frames` frames were all silent.
     bool push_frame(const std::vector<float>& pcm_48k);
-
     void reset();
 
 private:
-    float   threshold_;
-    int     hold_frames_;
-    int     silent_count_ = 0;
+    float threshold_;
+    int   hold_frames_;
+    int   silent_count_ = 0;
 
     static float rms(const std::vector<float>& pcm);
 };
 
 // ---------------------------------------------------------------------------
-// TranscriptBuffer — accumulates text tokens into a rolling text transcript
+// TranscriptBuffer — accumulates decoded text from PP
 // ---------------------------------------------------------------------------
 class TranscriptBuffer {
 public:
     explicit TranscriptBuffer(int max_tokens = 500);
 
     void push_token(int32_t token);
-    void push_text(const std::string& text);  // Append decoded text from PP
+    void push_text(const std::string& text);
     void clear();
 
-    // Returns raw token IDs for recent N tokens
     std::vector<int32_t> recent_tokens(int n = 50) const;
-
-    // Returns accumulated decoded text from the PP pipeline.
     std::string as_text() const;
-
     int size() const;
 
 private:
     int                  max_tokens_;
     mutable std::mutex   mtx_;
     std::deque<int32_t>  tokens_;
-    std::string          decoded_text_;  // Accumulated decoded text
+    std::string          decoded_text_;
 };
 
 // ---------------------------------------------------------------------------
-// OrchestratorState — which Ping-Pong state are we in
+// NodeRole — which PP instance are we referring to
+// ---------------------------------------------------------------------------
+enum class NodeRole { Active, Standby, Filler };
+
+// ---------------------------------------------------------------------------
+// OrchestratorState — coarse FSM state
 // ---------------------------------------------------------------------------
 enum class OrchestratorState {
-    SINGLE,      // Only hot node, no standby (fallback / startup)
-    HOT_ONLY,    // Hot is running, standby not yet initialised
-    PRIMING,     // Brain query in flight + standby initialising
-    STANDBY_READY,  // Standby is init'd; waiting for silence to switch
-    SWITCHING,   // Switch in progress (teardown old hot)
+    HOT_ONLY,      // Only Active running
+    STANDBY_READY, // Standby primed, waiting for node.switch command
+    FILLER_ACTIVE, // Filler is active (Active paused), brain working
+    SWITCHING,     // Switch in progress
 };
 
 // ---------------------------------------------------------------------------
-// Orchestrator
+// Orchestrator — v3 client-driven
 // ---------------------------------------------------------------------------
 class Orchestrator {
 public:
-    // Callback types used to communicate back to the gateway layer
-    using SendFn  = std::function<void(std::string)>;  // post JSON to client
+    using SendFn = std::function<void(std::string)>;
 
     Orchestrator(const Config& cfg, std::shared_ptr<Session> sess, SendFn send);
     ~Orchestrator();
 
-    // Main entry point — call from the session worker thread.
-    // Blocks until session ends.
+    // Main loop — blocks until session ends.
     void run();
 
+    // Called by the WebSocket handler on incoming client commands.
+    // Thread-safe.
+    void handle_command(const std::string& json_cmd);
+
 private:
-    // ---------- core loop helpers ----------
-    void init_hot();
-    void request_brain_async(const std::string& transcript);
-    void init_standby(const std::string& boot_payload);
-    void execute_switch();
+    // ── PP session management ──────────────────────────────────────────────
+    void init_active();
+    void init_filler(const std::string& filler_prompt);
+    void reset_filler();   // Tear down filler corrid and re-prime with same prompt
 
-    // ---------- trigger logic ----------
-    bool should_trigger_brain() const;
-    std::string build_brain_prompt(const std::string& persona) const;
-    std::string build_boot_payload(const std::string& brain_response) const;
+    // ── Node switching (client-commanded) ─────────────────────────────────
+    void cmd_switch(NodeRole to);          // Switch to standby or filler
+    void cmd_prime(NodeRole target,
+                   const std::string& prompt,
+                   const std::string& voice);
+    void cmd_activate(NodeRole target);    // Manual (testing)
+    void cmd_pause(NodeRole target);       // Manual (testing)
+    void cmd_stop(NodeRole target);        // Reset filler after use
 
-    // ---------- state ----------
-    const Config&                    cfg_;
-    std::shared_ptr<Session>         sess_;
-    SendFn                           send_;
+    // ── Helpers ───────────────────────────────────────────────────────────
+    TritonSession* active_session();
+    void execute_switch_to_standby();
+    void execute_switch_to_filler();
+    void send_node_status();
+    void send_transcript_delta(const std::string& text);
 
-    // Triton sessions — hot is always active, standby may be null
-    std::unique_ptr<TritonSession>   ts_hot_;
-    std::unique_ptr<TritonSession>   ts_standby_;
-    int64_t                          corrid_hot_     = 1;
-    int64_t                          corrid_standby_ = 2;
+    // ── State ─────────────────────────────────────────────────────────────
+    const Config&               cfg_;
+    std::shared_ptr<Session>    sess_;
+    SendFn                      send_;
 
-    // Brain LLM client (optional — null if LOAD_BRAIN=0)
-    std::unique_ptr<BrainClient>     brain_;
-    bool                             brain_available_ = false;
+    // Three PP sessions — only Active is always non-null after init
+    std::unique_ptr<TritonSession>  ts_active_;
+    std::unique_ptr<TritonSession>  ts_standby_;
+    std::unique_ptr<TritonSession>  ts_filler_;
+
+    // Fixed corrids for each role
+    static constexpr int64_t kCorridActive  = 1;
+    static constexpr int64_t kCorridStandby = 1001;
+    static constexpr int64_t kCorridFiller  = 2001;
+
+    // Filler prompt — set by session.configure, reused on reset
+    std::string filler_prompt_;
 
     // Transcript
-    TranscriptBuffer                 transcript_;
+    TranscriptBuffer transcript_;
 
-    // Silence detector
-    SilenceDetector                  silence_;
+    // Silence detector (used for auto switch-on-silence if standby is ready)
+    SilenceDetector silence_;
 
-    // Orchestrator state machine
-    std::atomic<OrchestratorState>   state_{OrchestratorState::HOT_ONLY};
+    // Orchestrator FSM
+    std::atomic<OrchestratorState> state_{OrchestratorState::HOT_ONLY};
 
-    // Async brain thread
-    std::thread                      brain_thread_;
-    std::atomic<bool>                brain_in_flight_{false};
-    std::string                      pending_boot_payload_;
-    mutable std::mutex               boot_mtx_;
-    std::atomic<bool>                boot_ready_{false};
+    // Pending commands from client (processed in run() loop)
+    struct Command { std::string type; std::string target; std::string prompt; std::string voice; };
+    std::vector<Command>  cmd_queue_;
+    std::mutex            cmd_mtx_;
 
-    // Switch gate: only queue one switch at a time
-    std::atomic<bool>                switch_queued_{false};
+    // Frame counter
+    int frame_no_ = 0;
 
-    // Frame counters
-    int                              frame_no_      = 0;
-    int                              frames_since_trigger_ = 0;
-
-    // Persona string from session config
-    std::string                      persona_;
+    // Persona
+    std::string persona_;
 };
 
 } // namespace pg

@@ -1,19 +1,20 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 // SPDX-License-Identifier: MIT
 //
-// gateway/src/main.cpp — PersonaPlex v2 Gateway with Ping-Pong Orchestrator
+// gateway/src/main.cpp — PersonaPlex v3 Gateway (Client-Driven)
 //
 // Architecture:
 //   uWS event loop thread:
 //     onOpen   → create Session, start session worker thread
-//     onMessage→ parse JSON event; audio → push to ring buffer;
+//     onMessage→ parse JSON event; audio → ring buffer;
+//                node.* / session.configure → orchestrator command_handler
 //                session.update → set config, signal worker
 //     onClose  → signal worker, SessionManager.remove()
 //
 //   Session worker thread (one per active session):
 //     1. Wait for config (session.update from client)
-//     2. Create Orchestrator (owns hot + standby TritonSessions + BrainClient)
-//     3. Orchestrator.run() drives the Ping-Pong loop until disconnect
+//     2. Create Orchestrator (Active + Standby + Filler PP sessions)
+//     3. Orchestrator.run() drives the audio loop until disconnect
 
 #include "config.h"
 #include "orchestrator.h"
@@ -98,11 +99,13 @@ int main(int argc, char** argv) {
         if (std::string(argv[i]) == "--sessions") cfg.max_sessions = std::atoi(argv[i+1]);
     }
 
-    std::cout << "PersonaPlex Gateway v2\n"
+    std::cout << "PersonaPlex Gateway v3\n"
               << "  WebSocket port : " << cfg.ws_port       << "\n"
               << "  Triton URL     : " << cfg.triton_url    << "\n"
               << "  Max sessions   : " << cfg.max_sessions  << "\n"
-              << "  TLS            : " << (cfg.ssl_cert.empty() ? "off" : "on") << "\n";
+              << "  TLS            : " << (cfg.ssl_cert.empty() ? "off" : "on") << "\n"
+              << "  Nodes          : Active + Standby + Filler (3 PP instances)\n"
+              << "  Brain          : client-side (workstation)\n";
 
     std::signal(SIGINT,  sighandler);
     std::signal(SIGTERM, sighandler);
@@ -170,6 +173,14 @@ int main(int argc, char** argv) {
                 }
 
                 switch (ev.type) {
+                case ClientEventType::NodeCommand: {
+                    // Route node.* and session.configure to orchestrator
+                    std::lock_guard<std::mutex> lk(sess->command_handler_mtx);
+                    if (sess->command_handler) {
+                        sess->command_handler(std::string(msg.data(), msg.size()));
+                    }
+                    break;
+                }
                 case ClientEventType::SessionUpdate: {
                     sess->config = ev.session;
                     sess->config_set = true;

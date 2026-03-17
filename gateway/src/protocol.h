@@ -23,6 +23,7 @@ enum class ClientEventType {
     InputAudioBufferClear,  // input_audio_buffer.clear
     ResponseCreate,         // response.create
     ResponseCancel,         // response.cancel
+    NodeCommand,            // node.switch, node.prime, node.activate, node.pause, node.stop, session.configure
 };
 
 // SessionConfig is defined in config.h

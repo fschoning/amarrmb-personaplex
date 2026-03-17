@@ -160,9 +160,15 @@ bool parse_client_event(const char* data, size_t len, ClientEvent& out) {
             // Field missing or not an array — voice is optional
         }
 
-        // persona_prompt — optional string for the brain LLM
+        // persona_prompt and filler_prompt
         if (sess["persona_prompt"].get(sv) == simdjson::SUCCESS)
             out.session.persona_prompt = std::string(sv);
+        if (sess["filler_prompt"].get(sv) == simdjson::SUCCESS)
+            out.session.filler_prompt = std::string(sv);
+
+    } else if (type_str.rfind("node.", 0) == 0 || type_str == "session.configure") {
+        // v3: Node commands — raw JSON routed to orchestrator::handle_command()
+        out.type = ClientEventType::NodeCommand;
 
     } else if (type_str == "input_audio_buffer.append") {
         out.type = ClientEventType::InputAudioBufferAppend;

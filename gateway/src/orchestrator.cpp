@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 // SPDX-License-Identifier: MIT
 //
-// gateway/src/orchestrator.cpp — Ping-Pong Orchestrator implementation
+// gateway/src/orchestrator.cpp — PersonaPlex v3 Client-Driven Orchestrator
 
 #include "orchestrator.h"
 #include "audio_utils.h"
@@ -14,6 +14,20 @@
 #include <cstdio>
 #include <numeric>
 #include <sstream>
+
+// Minimal JSON serialisation (no third-party dep, only used for simple events)
+// For parsing we rely on protocol.cpp's parser.
+static std::string json_str(const std::string& s) {
+    std::string r = "\"";
+    for (char c : s) {
+        if (c == '"') r += "\\\"";
+        else if (c == '\\') r += "\\\\";
+        else if (c == '\n') r += "\\n";
+        else r += c;
+    }
+    r += "\"";
+    return r;
+}
 
 namespace pg {
 
@@ -37,11 +51,7 @@ float SilenceDetector::rms(const std::vector<float>& pcm) {
 
 bool SilenceDetector::push_frame(const std::vector<float>& pcm_48k) {
     float energy = rms(pcm_48k);
-    if (energy < threshold_) {
-        ++silent_count_;
-    } else {
-        silent_count_ = 0;
-    }
+    if (energy < threshold_) { ++silent_count_; } else { silent_count_ = 0; }
     return silent_count_ >= hold_frames_;
 }
 
@@ -51,9 +61,7 @@ void SilenceDetector::reset() { silent_count_ = 0; }
 // TranscriptBuffer
 // ============================================================================
 
-TranscriptBuffer::TranscriptBuffer(int max_tokens)
-    : max_tokens_(max_tokens)
-{}
+TranscriptBuffer::TranscriptBuffer(int max_tokens) : max_tokens_(max_tokens) {}
 
 void TranscriptBuffer::push_token(int32_t token) {
     if (token <= 0) return;
@@ -67,10 +75,8 @@ void TranscriptBuffer::push_text(const std::string& text) {
     if (text.empty()) return;
     std::lock_guard<std::mutex> lk(mtx_);
     decoded_text_ += text;
-    // Keep decoded text from growing unbounded (~50K chars max)
-    if (decoded_text_.size() > 50000) {
+    if (decoded_text_.size() > 50000)
         decoded_text_ = decoded_text_.substr(decoded_text_.size() - 40000);
-    }
 }
 
 void TranscriptBuffer::clear() {
@@ -82,7 +88,7 @@ void TranscriptBuffer::clear() {
 std::vector<int32_t> TranscriptBuffer::recent_tokens(int n) const {
     std::lock_guard<std::mutex> lk(mtx_);
     int start = std::max(0, static_cast<int>(tokens_.size()) - n);
-    return std::vector<int32_t>(tokens_.begin() + start, tokens_.end());
+    return {tokens_.begin() + start, tokens_.end()};
 }
 
 std::string TranscriptBuffer::as_text() const {
@@ -99,337 +105,429 @@ int TranscriptBuffer::size() const {
 // Orchestrator
 // ============================================================================
 
-Orchestrator::Orchestrator(const Config& cfg,
-                           std::shared_ptr<Session> sess,
-                           SendFn send)
-    : cfg_(cfg)
-    , sess_(sess)
-    , send_(send)
-    , corrid_hot_(sess->corrid)
-    , corrid_standby_(sess->corrid + 1000)
-    , silence_(cfg.silence_threshold, cfg.silence_hold_frames)
+Orchestrator::Orchestrator(const Config& cfg, std::shared_ptr<Session> sess, SendFn send)
+    : cfg_(cfg), sess_(sess), send_(std::move(send))
 {
-    // Persona from session config
-    persona_ = sess_->config.persona_prompt.empty()
-        ? "You are a friendly and knowledgeable AI assistant."
-        : sess_->config.persona_prompt;
+    persona_ = sess_->config.instructions;
+    filler_prompt_ = sess_->config.filler_prompt.empty()
+        ? cfg_.default_filler_prompt
+        : sess_->config.filler_prompt;
 
-    // Try to connect to brain
-    try {
-        brain_ = std::make_unique<BrainClient>(cfg_.brain_grpc_url, "brain");
-        brain_available_ = brain_->is_ready();
-        if (brain_available_)
-            fprintf(stderr, "[orchestrator] Brain LLM available.\n");
-        else
-            fprintf(stderr, "[orchestrator] Brain LLM not ready — running without context switching.\n");
-    } catch (const std::exception& e) {
-        fprintf(stderr, "[orchestrator] Brain LLM unavailable: %s\n", e.what());
-        brain_available_ = false;
+    // Register command handler so main.cpp can route node.* commands here
+    {
+        std::lock_guard<std::mutex> lk(sess_->command_handler_mtx);
+        sess_->command_handler = [this](std::string cmd) {
+            handle_command(std::move(cmd));
+        };
     }
 }
 
-Orchestrator::~Orchestrator() {
-    if (brain_thread_.joinable()) brain_thread_.join();
-}
+Orchestrator::~Orchestrator() {}
 
 // ---------------------------------------------------------------------------
-// run() — main loop, called from session_worker thread
+// run — main audio loop (blocks until session ends)
 // ---------------------------------------------------------------------------
 void Orchestrator::run() {
-    init_hot();
+    // Init Active PP
+    init_active();
 
-    std::string resp_id = "resp_" + sess_->session_id;
-    std::string item_id = "item_" + sess_->session_id;
+    // Pre-prime Filler PP in background
+    std::thread filler_init_thread([this]() {
+        try {
+            init_filler(filler_prompt_);
+        } catch (const std::exception& e) {
+            fprintf(stderr, "[orchestrator] Filler init failed: %s\n", e.what());
+        }
+    });
+    filler_init_thread.detach();
 
-    std::vector<float> frame_buf(FRAME_SAMPLES_24K);
+    // ── Audio loop ─────────────────────────────────────────────────────────
+    static const std::string resp_id = "resp-0";
+    static const std::string item_id = "item-0";
 
     while (!sess_->should_close.load()) {
-        // ── Pop 80ms of PCM from ring buffer ──────────────────────────────
-        size_t got = sess_->audio_in.pop(frame_buf.data(), FRAME_SAMPLES_24K, 200);
-        if (got == 0) continue;
 
-        // ── Send frame to hot node ─────────────────────────────────────────
+        // ── Process pending commands from client ───────────────────────────
+        {
+            std::vector<Command> cmds;
+            {
+                std::lock_guard<std::mutex> lk(cmd_mtx_);
+                std::swap(cmds, cmd_queue_);
+            }
+            for (auto& cmd : cmds) {
+                if (cmd.type == "node.switch") {
+                    if (cmd.target == "standby") cmd_switch(NodeRole::Standby);
+                    else if (cmd.target == "filler") cmd_switch(NodeRole::Filler);
+                } else if (cmd.type == "node.prime") {
+                    NodeRole r = (cmd.target == "standby") ? NodeRole::Standby : NodeRole::Filler;
+                    cmd_prime(r, cmd.prompt, cmd.voice);
+                } else if (cmd.type == "node.activate") {
+                    NodeRole r = (cmd.target == "standby") ? NodeRole::Standby
+                               : (cmd.target == "filler")  ? NodeRole::Filler
+                                                           : NodeRole::Active;
+                    cmd_activate(r);
+                } else if (cmd.type == "node.pause") {
+                    NodeRole r = (cmd.target == "active") ? NodeRole::Active
+                               : (cmd.target == "filler") ? NodeRole::Filler
+                                                          : NodeRole::Standby;
+                    cmd_pause(r);
+                } else if (cmd.type == "node.stop") {
+                    if (cmd.target == "filler") cmd_stop(NodeRole::Filler);
+                } else if (cmd.type == "session.configure") {
+                    if (!cmd.prompt.empty()) {
+                        filler_prompt_ = cmd.prompt;
+                        fprintf(stderr, "[orchestrator] filler_prompt updated.\n");
+                    }
+                    send_node_status();
+                }
+            }
+        }
+
+        // ── Read next audio chunk from ring buffer ─────────────────────────
+        std::vector<float> pcm_24k(FRAME_SAMPLES_24K, 0.f);
+        size_t got = sess_->audio_in.pop(pcm_24k.data(), FRAME_SAMPLES_24K, 50);
+        if (got == 0) {
+            if (sess_->should_close.load()) break;
+            continue;
+        }
+        if (got < FRAME_SAMPLES_24K)
+            std::fill(pcm_24k.begin() + got, pcm_24k.end(), 0.f);
+
+        // ── Infer on Active session ────────────────────────────────────────
         FrameOutput out;
         bool ok = false;
-        try {
-            ok = ts_hot_->send_frame(frame_buf.data(), FRAME_SAMPLES_24K, out);
-        } catch (const std::exception& e) {
-            fprintf(stderr, "[orchestrator] hot node error: %s\n", e.what());
-            break;
+        if (ts_active_) {
+            ok = ts_active_->send_frame(pcm_24k.data(), pcm_24k.size(), out);
         }
-        if (!ok) break;
 
-        // ── Audio → client ─────────────────────────────────────────────────
+        if (!ok) {
+            fprintf(stderr, "[orchestrator] Active PP inference failed, skipping frame.\n");
+            continue;
+        }
+
+        // ── Send audio to client ──────────────────────────────────────────
         if (!out.pcm_48k.empty()) {
-            std::string b64 = encode_audio_delta(out.pcm_48k.data(), out.pcm_48k.size());
+            std::string b64 = encode_pcm16_b64(out.pcm_48k);
             send_(make_audio_delta(resp_id, item_id, b64));
         }
 
-        // ── Text token → transcript ────────────────────────────────────────
+        // ── Transcript accumulation and streaming ─────────────────────────
         if (out.text_token > 0 && out.text_token < 32000) {
             transcript_.push_token(out.text_token);
         }
-        // Decoded text from PP → transcript
         if (!out.text_decoded.empty()) {
             transcript_.push_text(out.text_decoded);
+            send_transcript_delta(out.text_decoded);
         }
 
         ++frame_no_;
-        ++frames_since_trigger_;
 
-        // Fire brain every ~5 seconds when not in-flight and there's new text
-        constexpr int kBrainEveryFrames = 62;  // 62 × 80ms ≈ 5s
-        if (brain_available_
-            && !brain_in_flight_.load()
-            && transcript_.size() >= 10
-            && frames_since_trigger_ >= kBrainEveryFrames)
-        {
-            std::string prompt = build_brain_prompt(persona_);
-            request_brain_async(prompt);
-            frames_since_trigger_ = 0;  // reset for next brain cycle
-        }
-
-        // ── Switch every 30s ───────────────────────────────────────────────
-        // At the 375-frame mark, if a boot payload is ready, wait for
-        // silence then init standby + switch.  With MPS, the standby init
-        // (~5s system prompts) runs on the same PP partition but brain is
-        // on its own partition and won't cause contention.
-        constexpr int kSwitchEveryFrames = 375;  // 375 × 80ms = 30s
-
-        if (frames_since_trigger_ >= kSwitchEveryFrames
-            && boot_ready_.load()
-            && !switch_queued_.load())
-        {
+        // ── Silence detection for scheduled node.switch ───────────────────
+        if (state_.load() == OrchestratorState::STANDBY_READY) {
             bool silent = silence_.push_frame(out.pcm_48k);
             if (silent) {
-                std::lock_guard<std::mutex> lk(boot_mtx_);
-                if (!pending_boot_payload_.empty()) {
-                    fprintf(stderr, "[orchestrator] 30s switch: silence detected, "
-                                    "init standby + switch (frame %d).\n", frame_no_);
-                    init_standby(pending_boot_payload_);
-                    pending_boot_payload_.clear();
-                    boot_ready_.store(false);
-
-                    if (state_.load() == OrchestratorState::STANDBY_READY) {
-                        execute_switch();
-                    }
-                }
+                fprintf(stderr, "[orchestrator] Standby ready + silence → switching.\n");
+                execute_switch_to_standby();
             }
         } else {
-            // Keep silence detector running even when not switching
             silence_.push_frame(out.pcm_48k);
         }
     }
 
-    // ── Clean shutdown ────────────────────────────────────────────────────
-    if (brain_thread_.joinable()) brain_thread_.join();
-    try { if (ts_hot_)     ts_hot_->send_end();     } catch (...) {}
+    // ── Shutdown ───────────────────────────────────────────────────────────
+    try { if (ts_active_)  ts_active_->send_end();  } catch (...) {}
     try { if (ts_standby_) ts_standby_->send_end(); } catch (...) {}
+    try { if (ts_filler_)  ts_filler_->send_end();  } catch (...) {}
     send_(make_audio_done(resp_id));
 }
 
 // ---------------------------------------------------------------------------
-// init_hot — start the hot TritonSession (blocks ~2-5s for system prompts)
+// handle_command — called from WebSocket thread, queues command for run()
 // ---------------------------------------------------------------------------
-void Orchestrator::init_hot() {
+void Orchestrator::handle_command(const std::string& json_cmd) {
+    // Minimal JSON parsing — extract "type", "target", "prompt", "to", "voice"
+    auto extract = [&](const std::string& key) -> std::string {
+        std::string search = "\"" + key + "\"";
+        auto pos = json_cmd.find(search);
+        if (pos == std::string::npos) return {};
+        pos = json_cmd.find(':', pos);
+        if (pos == std::string::npos) return {};
+        pos = json_cmd.find('"', pos);
+        if (pos == std::string::npos) return {};
+        auto end = json_cmd.find('"', pos + 1);
+        if (end == std::string::npos) return {};
+        return json_cmd.substr(pos + 1, end - pos - 1);
+    };
+
+    Command cmd;
+    cmd.type   = extract("type");
+    // "to" is alias for "target" in node.switch
+    cmd.target = extract("target");
+    if (cmd.target.empty()) cmd.target = extract("to");
+    cmd.prompt = extract("prompt");
+    cmd.voice  = extract("voice");
+
+    if (cmd.type.empty()) {
+        fprintf(stderr, "[orchestrator] Unrecognised command: %.80s\n", json_cmd.c_str());
+        return;
+    }
+
+    fprintf(stderr, "[orchestrator] Command: type=%s target=%s\n",
+            cmd.type.c_str(), cmd.target.c_str());
+
+    std::lock_guard<std::mutex> lk(cmd_mtx_);
+    cmd_queue_.push_back(std::move(cmd));
+}
+
+// ---------------------------------------------------------------------------
+// init_active — start Active TritonSession
+// ---------------------------------------------------------------------------
+void Orchestrator::init_active() {
     std::vector<uint8_t> voice_bytes;
     if (!sess_->config.voice_prompt_embedding.empty()) {
         const auto& emb = sess_->config.voice_prompt_embedding;
         voice_bytes = base64_decode(emb.data(), emb.size());
     }
-
     std::vector<int32_t> text_tokens = sess_->config.text_prompt_tokens;
 
-    fprintf(stderr, "[orchestrator] init_hot: corrid=%ld voice_bytes=%zu text_tokens=%zu\n",
-            corrid_hot_, voice_bytes.size(), text_tokens.size());
+    fprintf(stderr, "[orchestrator] init_active: corrid=%ld voice=%zu text=%zu\n",
+            kCorridActive, voice_bytes.size(), text_tokens.size());
 
-    ts_hot_ = std::make_unique<TritonSession>(
-        cfg_.triton_url, cfg_.pipeline_model, corrid_hot_, cfg_.model_version);
+    ts_active_ = std::make_unique<TritonSession>(
+        cfg_.triton_url, cfg_.pipeline_model, kCorridActive, cfg_.model_version);
 
-    bool ok = ts_hot_->send_start(voice_bytes, text_tokens);
-    if (!ok) throw std::runtime_error("hot node send_start failed");
+    if (!ts_active_->send_start(voice_bytes, text_tokens))
+        throw std::runtime_error("Active node send_start failed");
 
     sess_->triton_ready.store(true);
     send_(make_session_ready(sess_->session_id));
     state_.store(OrchestratorState::HOT_ONLY);
-    fprintf(stderr, "[orchestrator] hot node READY.\n");
+    send_node_status();
+    fprintf(stderr, "[orchestrator] Active node READY.\n");
 }
 
 // ---------------------------------------------------------------------------
-// request_brain_async — fire off brain query on a background thread
+// init_filler — start Filler TritonSession with its prompt
 // ---------------------------------------------------------------------------
-void Orchestrator::request_brain_async(const std::string& prompt) {
-    if (brain_in_flight_.load()) return;
-    brain_in_flight_.store(true);
-    state_.store(OrchestratorState::PRIMING);
-
-    // Detach previous thread if done
-    if (brain_thread_.joinable()) brain_thread_.join();
-
-    brain_thread_ = std::thread([this, prompt]() {
-        fprintf(stderr, "[brain] querying (prompt_len=%zu)...\n", prompt.size());
-        auto t0   = std::chrono::steady_clock::now();
-        std::string response = brain_->query(prompt, 200);
-        auto ms   = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now() - t0).count();
-        fprintf(stderr, "[brain] response in %ldms: %.80s...\n", ms, response.c_str());
-
-        if (!response.empty()) {
-            std::string boot = build_boot_payload(response);
-            {
-                std::lock_guard<std::mutex> lk(boot_mtx_);
-                pending_boot_payload_ = std::move(boot);
-            }
-            boot_ready_.store(true);
-        } else {
-            fprintf(stderr, "[brain] empty response.\n");
-        }
-
-        // Always return to HOT_ONLY so brain can fire again immediately
-        state_.store(OrchestratorState::HOT_ONLY);
-        brain_in_flight_.store(false);
-    });
-}
-
-// ---------------------------------------------------------------------------
-// init_standby — send START to the standby node with the boot payload
-// ---------------------------------------------------------------------------
-void Orchestrator::init_standby(const std::string& boot_payload) {
-    fprintf(stderr, "[orchestrator] init_standby: corrid=%ld\n", corrid_standby_);
-
-    // Tear down any existing standby
-    if (ts_standby_) {
-        try { ts_standby_->send_end(); } catch (...) {}
-        ts_standby_.reset();
-    }
-
-    ts_standby_ = std::make_unique<TritonSession>(
-        cfg_.triton_url, cfg_.pipeline_model, corrid_standby_, cfg_.model_version);
-
-    // Reuse the SAME voice as the hot node (from session config)
+void Orchestrator::init_filler(const std::string& prompt) {
     std::vector<uint8_t> voice_bytes;
     if (!sess_->config.voice_prompt_embedding.empty()) {
         const auto& emb = sess_->config.voice_prompt_embedding;
         voice_bytes = base64_decode(emb.data(), emb.size());
     }
-
-    // Carry over voice name tokens (e.g. [-999, 78, 65, 84, 70, 48] = "NATF0")
     std::vector<int32_t> text_tokens = sess_->config.text_prompt_tokens;
 
-    fprintf(stderr, "[orchestrator] standby using voice_bytes=%zu text_tokens=%zu\n",
-            voice_bytes.size(), text_tokens.size());
+    // Encode filler system prompt as text tokens (prefix with filler marker)
+    // The Filler PP gets a short, forceful system prompt:
+    //   "You are a pause-filler. ONLY say variations of: 'I'm working on that for you,
+    //    just a moment'. Never answer questions. Never provide information."
+    // For now: pass standard voice tokens, log the prompt.
+    // Phase 2: inject the prompt text into the LM context.
+    fprintf(stderr, "[orchestrator] init_filler: corrid=%ld prompt=%.60s...\n",
+            kCorridFiller, prompt.c_str());
 
-    // TODO(phase4): inject boot_payload as text context into the pipeline
-    // For now: boot_payload is logged but not delivered to the LM.
-    fprintf(stderr, "[orchestrator] boot_payload (%zu bytes): %.100s...\n",
-            boot_payload.size(), boot_payload.c_str());
+    ts_filler_ = std::make_unique<TritonSession>(
+        cfg_.triton_url, cfg_.pipeline_model, kCorridFiller, cfg_.model_version);
 
-    bool ok = ts_standby_->send_start(voice_bytes, text_tokens);
-    if (!ok) {
-        fprintf(stderr, "[orchestrator] standby send_start failed — aborting switch.\n");
-        ts_standby_.reset();
-        state_.store(OrchestratorState::HOT_ONLY);
+    if (!ts_filler_->send_start(voice_bytes, text_tokens)) {
+        fprintf(stderr, "[orchestrator] Filler send_start failed.\n");
+        ts_filler_.reset();
         return;
     }
 
-    state_.store(OrchestratorState::STANDBY_READY);
-    fprintf(stderr, "[orchestrator] standby READY. Waiting for silence...\n");
+    fprintf(stderr, "[orchestrator] Filler node READY (idle).\n");
 }
 
 // ---------------------------------------------------------------------------
-// execute_switch — swap hot ↔ standby at a silence boundary
+// reset_filler — tear down and re-prime filler after use
 // ---------------------------------------------------------------------------
-void Orchestrator::execute_switch() {
-    switch_queued_.store(true);
-    state_.store(OrchestratorState::SWITCHING);
+void Orchestrator::reset_filler() {
+    fprintf(stderr, "[orchestrator] reset_filler: tearing down and re-priming.\n");
+    if (ts_filler_) {
+        try { ts_filler_->send_end(); } catch (...) {}
+        ts_filler_.reset();
+    }
+    // Re-prime in background
+    std::thread t([this]() {
+        try { init_filler(filler_prompt_); } catch (...) {}
+    });
+    t.detach();
+}
 
-    // Swap the two sessions
-    std::swap(ts_hot_, ts_standby_);
-    std::swap(corrid_hot_, corrid_standby_);
+// ---------------------------------------------------------------------------
+// cmd_switch — primary switch command from client
+// ---------------------------------------------------------------------------
+void Orchestrator::cmd_switch(NodeRole to) {
+    if (to == NodeRole::Standby) {
+        if (!ts_standby_) {
+            fprintf(stderr, "[orchestrator] node.switch to standby: standby not primed.\n");
+            send_(make_error("node_error", "Standby not primed"));
+            return;
+        }
+        // Wait for silence then switch — mark state and let run() loop do it
+        state_.store(OrchestratorState::STANDBY_READY);
+        fprintf(stderr, "[orchestrator] node.switch: waiting for silence to switch to standby.\n");
 
-    fprintf(stderr, "[orchestrator] SWITCHED: new hot corrid=%ld\n", corrid_hot_);
+    } else if (to == NodeRole::Filler) {
+        execute_switch_to_filler();
+    }
+}
 
-    // Tear down the old hot (now in ts_standby_ slot)
+// ---------------------------------------------------------------------------
+// cmd_prime — load new context into standby or filler
+// ---------------------------------------------------------------------------
+void Orchestrator::cmd_prime(NodeRole target, const std::string& prompt, const std::string& voice) {
+    if (target != NodeRole::Standby) {
+        fprintf(stderr, "[orchestrator] node.prime: only standby supported.\n");
+        return;
+    }
+
+    fprintf(stderr, "[orchestrator] node.prime standby: prompt=%.60s...\n", prompt.c_str());
+
+    // Tear down existing standby
     if (ts_standby_) {
         try { ts_standby_->send_end(); } catch (...) {}
         ts_standby_.reset();
     }
 
-    // Clear transcript — new node starts fresh
-    transcript_.clear();
-    silence_.reset();
-    frames_since_trigger_ = 0;
+    std::vector<uint8_t> voice_bytes;
+    if (!sess_->config.voice_prompt_embedding.empty()) {
+        const auto& emb = sess_->config.voice_prompt_embedding;
+        voice_bytes = base64_decode(emb.data(), emb.size());
+    }
+    // TODO(v3.1): override voice if 'voice' param set
+    std::vector<int32_t> text_tokens = sess_->config.text_prompt_tokens;
 
-    state_.store(OrchestratorState::HOT_ONLY);
-    switch_queued_.store(false);
+    ts_standby_ = std::make_unique<TritonSession>(
+        cfg_.triton_url, cfg_.pipeline_model, kCorridStandby, cfg_.model_version);
 
-    fprintf(stderr, "[orchestrator] switch complete.\n");
-}
-
-// ---------------------------------------------------------------------------
-// should_trigger_brain — returns true when we should ask the brain for context
-// ---------------------------------------------------------------------------
-bool Orchestrator::should_trigger_brain() const {
-    // Trigger every ~10 seconds of speech (125 frames × 80ms = 10s)
-    // AND only if we have at least 20 text tokens (some speech happened)
-    // Trigger every ~30 seconds of audio (375 frames × 80ms = 30s).
-    // Brain generation takes ~6s → choppy for ~6s every 30s (20% of cycle).
-    // At 10s it was 60% choppy — unacceptable.
-    constexpr int kTriggerEveryFrames = 375;
-    constexpr int kMinTokens          = 20;
-    return frames_since_trigger_ >= kTriggerEveryFrames
-        && transcript_.size() >= kMinTokens;
-}
-
-// ---------------------------------------------------------------------------
-// build_brain_prompt — assemble the prompt to send to the brain LLM
-// ---------------------------------------------------------------------------
-std::string Orchestrator::build_brain_prompt(const std::string& persona) const {
-    std::string transcript = transcript_.as_text();
-    int n_tokens = transcript_.size();
-    int duration_s = frame_no_ * 80 / 1000;
-
-    std::ostringstream oss;
-    oss << "You are the brain behind a voice AI agent. "
-        << "Your job is to write a context handoff note so a new instance "
-        << "of the AI can continue the conversation seamlessly.\n\n"
-        << "AI Persona: " << persona << "\n"
-        << "Session duration: " << duration_s << " seconds\n"
-        << "Speech tokens generated: " << n_tokens << "\n\n";
-
-    if (!transcript.empty()) {
-        // Include the last ~4000 chars of transcript (most recent ~3 minutes)
-        std::string recent = transcript;
-        if (recent.size() > 4000) {
-            recent = "..." + recent.substr(recent.size() - 4000);
-        }
-        oss << "=== TRANSCRIPT (AI speech) ===\n"
-            << recent << "\n"
-            << "=== END TRANSCRIPT ===\n\n";
-    } else {
-        oss << "(No transcript yet -- conversation just started)\n\n";
+    if (!ts_standby_->send_start(voice_bytes, text_tokens)) {
+        fprintf(stderr, "[orchestrator] Standby send_start failed.\n");
+        ts_standby_.reset();
+        send_(make_error("node_error", "Standby prime failed"));
+        return;
     }
 
-    oss << "Based on the transcript above, write a BOOT_PAYLOAD for the "
-        << "next AI instance. Structure your response EXACTLY as:\n"
-        << "[SUMMARY] What was being discussed (key topics, names, facts)\n"
-        << "[CONTEXT] What the AI should know to continue naturally\n"
-        << "[LAST_TOPIC] The most recent topic/question being addressed\n"
-        << "[EMOTION] Tone of voice to match\n"
-        << "[PERSONA] " << persona;
-
-    return oss.str();
+    // Notify client that standby is ready to switch
+    std::string status = "{\"type\":\"node.standby_ready\",\"target\":\"standby\"}";
+    send_(status);
+    fprintf(stderr, "[orchestrator] Standby READY.\n");
 }
 
 // ---------------------------------------------------------------------------
-// build_boot_payload -- wrap brain response in PersonaPlex system format
+// cmd_activate — manual activate (testing)
 // ---------------------------------------------------------------------------
-std::string Orchestrator::build_boot_payload(const std::string& brain_response) const {
+void Orchestrator::cmd_activate(NodeRole target) {
+    if (target == NodeRole::Standby) {
+        execute_switch_to_standby();
+    } else if (target == NodeRole::Filler) {
+        execute_switch_to_filler();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cmd_pause — manual pause (testing)
+// ---------------------------------------------------------------------------
+void Orchestrator::cmd_pause(NodeRole target) {
+    fprintf(stderr, "[orchestrator] node.pause %s (testing mode - frame routing continues)\n",
+            target == NodeRole::Active ? "active" : "filler");
+    // In testing mode: pause is a no-op, the active PP keeps generating
+    // Full pause support (stopping frame sending) is a future feature
+}
+
+// ---------------------------------------------------------------------------
+// cmd_stop — stop a node (filler: reset and re-prime)
+// ---------------------------------------------------------------------------
+void Orchestrator::cmd_stop(NodeRole target) {
+    if (target == NodeRole::Filler) {
+        // Make sure we're not in filler mode
+        if (state_.load() == OrchestratorState::FILLER_ACTIVE) {
+            // Switch back to active first — need a standby or we stay on active
+            fprintf(stderr, "[orchestrator] node.stop filler: returning to active.\n");
+            // Re-route audio back to original active (now ts_standby_ holds old active)
+            if (ts_standby_) {
+                std::swap(ts_active_, ts_standby_);
+                ts_active_->send_end();  // this was the filler
+            }
+            state_.store(OrchestratorState::HOT_ONLY);
+        }
+        reset_filler();
+        send_node_status();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// execute_switch_to_standby
+// ---------------------------------------------------------------------------
+void Orchestrator::execute_switch_to_standby() {
+    state_.store(OrchestratorState::SWITCHING);
+
+    // Old active → tear down. Standby → becomes active.
+    std::swap(ts_active_, ts_standby_);
+    try { if (ts_standby_) { ts_standby_->send_end(); ts_standby_.reset(); } } catch (...) {}
+
+    transcript_.clear();
+    silence_.reset();
+    frame_no_ = 0;
+
+    state_.store(OrchestratorState::HOT_ONLY);
+    send_node_status();
+    fprintf(stderr, "[orchestrator] Switched: standby → active.\n");
+}
+
+// ---------------------------------------------------------------------------
+// execute_switch_to_filler
+// ---------------------------------------------------------------------------
+void Orchestrator::execute_switch_to_filler() {
+    if (!ts_filler_) {
+        fprintf(stderr, "[orchestrator] node.switch to filler: filler not ready.\n");
+        send_(make_error("node_error", "Filler not ready"));
+        return;
+    }
+
+    state_.store(OrchestratorState::FILLER_ACTIVE);
+
+    // Park current active in standby slot (so we can restore later)
+    // Note: old standby (if any) is discarded
+    if (ts_standby_) {
+        try { ts_standby_->send_end(); } catch (...) {}
+    }
+    ts_standby_ = std::move(ts_active_);
+    ts_active_  = std::move(ts_filler_);
+
+    // Filler is now active — it will respond to incoming audio
+    send_node_status();
+    fprintf(stderr, "[orchestrator] Switched: filler → active. Old active parked as standby.\n");
+}
+
+// ---------------------------------------------------------------------------
+// send_node_status
+// ---------------------------------------------------------------------------
+void Orchestrator::send_node_status() {
+    std::string state_str;
+    switch (state_.load()) {
+        case OrchestratorState::HOT_ONLY:      state_str = "hot_only"; break;
+        case OrchestratorState::STANDBY_READY: state_str = "standby_ready"; break;
+        case OrchestratorState::FILLER_ACTIVE: state_str = "filler_active"; break;
+        case OrchestratorState::SWITCHING:     state_str = "switching"; break;
+    }
     std::ostringstream oss;
-    oss << "<system>\n"
-        << brain_response << "\n"
-        << "</system>";
-    return oss.str();
+    oss << "{\"type\":\"node.status\","
+        << "\"active\":"   << (ts_active_  ? "true" : "false") << ","
+        << "\"standby\":"  << (ts_standby_ ? "true" : "false") << ","
+        << "\"filler\":"   << (ts_filler_  ? "true" : "false") << ","
+        << "\"state\":"    << json_str(state_str) << "}";
+    send_(oss.str());
+}
+
+// ---------------------------------------------------------------------------
+// send_transcript_delta — stream decoded text to client
+// ---------------------------------------------------------------------------
+void Orchestrator::send_transcript_delta(const std::string& text) {
+    std::ostringstream oss;
+    oss << "{\"type\":\"transcript.delta\",\"text\":" << json_str(text)
+        << ",\"frame\":" << frame_no_ << "}";
+    send_(oss.str());
 }
 
 } // namespace pg

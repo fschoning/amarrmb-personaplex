@@ -13,10 +13,11 @@ namespace pg {
 
 // Session-specific configuration, sent by client at session start
 struct SessionConfig {
-    std::string              instructions;           // text system prompt
+    std::string              instructions;           // text system prompt (persona)
     std::string              voice_prompt_embedding; // base64-encoded .pt bytes
     std::vector<int32_t>     text_prompt_tokens;     // optional: voice name as int32 sentinel
-    std::string              persona_prompt;         // orchestrator persona (for brain LLM)
+    std::string              persona_prompt;         // orchestrator persona
+    std::string              filler_prompt;          // Filler PP system prompt
     std::string              input_audio_format  = "pcm16";
     std::string              output_audio_format = "pcm16";
     float                    temperature         = 0.8f;
@@ -37,18 +38,21 @@ struct Config {
     // Defaults to triton_url if not set (backward-compatible single-container mode)
     std::string brain_grpc_url = "";
 
-    // Concurrency cap — must match instance_group.count in Triton configs
+    // Concurrency cap — must match instance_group.count in Triton config (now 3)
     int         max_sessions   = 6;
 
     // Session lifecycle
-    int         session_timeout_s = 300;      // idle timeout before forceful close
-    int         audio_buffer_ms   = 2000;     // ring buffer depth (ms at 24kHz)
+    int         session_timeout_s = 300;
+    int         audio_buffer_ms   = 2000;
 
-    // Silence detection for Ping-Pong switch
-    float       silence_threshold   = 0.005f;    // RMS below this = silent
-    int         silence_hold_frames = 4;         // 4 × 80ms = 320ms silence window
+    // Silence detection for node switch
+    float       silence_threshold   = 0.005f;
+    int         silence_hold_frames = 4;
     std::string pipeline_model = "personaplex_pipeline";
-    int64_t     model_version  = -1;          // -1 = latest
+    int64_t     model_version  = -1;
+
+    // Default filler prompt (overridable per-session via session.configure)
+    std::string default_filler_prompt = "Hold on, I'm working on that for you. Just a moment.";
 
     static Config from_env() {
         Config c;
@@ -66,10 +70,10 @@ struct Config {
         c.ssl_cert       = get("SSL_CERT",        "");
         c.ssl_key        = get("SSL_KEY",         "");
         c.triton_url     = get("TRITON_GRPC_URL", c.triton_url.c_str());
-        c.brain_grpc_url = get("BRAIN_GRPC_URL",  c.triton_url.c_str());  // fallback to triton_url
         c.max_sessions   = geti("MAX_SESSIONS",   c.max_sessions);
         c.session_timeout_s = geti("SESSION_TIMEOUT_S", c.session_timeout_s);
         c.pipeline_model = get("PIPELINE_MODEL",  c.pipeline_model.c_str());
+        c.default_filler_prompt = get("FILLER_PROMPT", c.default_filler_prompt.c_str());
         return c;
     }
 };
